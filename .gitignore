@@ -1,3 +1,7 @@
 cronoprogrammi/
 output/
 Mappatura_MDR_passati.xlsx
+config.txt
+mdr_cache.csv
+__pycache__/
+output_v2/
