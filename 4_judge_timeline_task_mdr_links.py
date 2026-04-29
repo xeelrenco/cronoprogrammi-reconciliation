@@ -183,32 +183,58 @@ def build_final_links(topk, cfg, progress_every):
     return pd.DataFrame(rows)
 
 
-def save_final_links(conn, db_name, rows):
-    if rows.empty:
+def build_judged_task_scope(topk):
+    if topk.empty:
+        return pd.DataFrame(columns=["TimelineName", "TaskRowId"])
+    return topk[["TimelineName", "TaskRowId"]].drop_duplicates().copy()
+
+
+def save_final_links(conn, db_name, rows, judged_scope):
+    if judged_scope.empty:
         return 0
-    conn.register("final_links", rows)
+    conn.register("judged_scope", judged_scope)
     try:
+        conn.execute("BEGIN;")
         conn.execute(
             f"""
-            INSERT INTO {db_name}.timeline_reconciliation.TimelineTaskToMdrLinks (
-                TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                TaskClass, TaskClassConfidence, TaskClassReason,
-                MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
-                ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
-                ConsolidatedConfidence, ConsolidatedReason, ConsolidatedSource, CreatedBy
-            )
-            SELECT
-                TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                TaskClass, TaskClassConfidence, TaskClassReason,
-                MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
-                ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
-                ConsolidatedConfidence, ConsolidatedReason, ConsolidatedSource, CreatedBy
-            FROM final_links
+            DELETE FROM {db_name}.timeline_reconciliation.TimelineTaskToMdrLinks t
+            USING judged_scope s
+            WHERE t.TimelineName = s.TimelineName
+              AND t.TaskRowId = s.TaskRowId
             """
         )
+        inserted = 0
+        if not rows.empty:
+            conn.register("final_links", rows)
+            try:
+                conn.execute(
+                    f"""
+                    INSERT INTO {db_name}.timeline_reconciliation.TimelineTaskToMdrLinks (
+                        TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
+                        TaskClass, TaskClassConfidence, TaskClassReason,
+                        MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
+                        ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
+                        ConsolidatedConfidence, ConsolidatedReason, ConsolidatedSource, CreatedBy
+                    )
+                    SELECT
+                        TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
+                        TaskClass, TaskClassConfidence, TaskClassReason,
+                        MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
+                        ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
+                        ConsolidatedConfidence, ConsolidatedReason, ConsolidatedSource, CreatedBy
+                    FROM final_links
+                    """
+                )
+                inserted = len(rows)
+            finally:
+                conn.unregister("final_links")
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
     finally:
-        conn.unregister("final_links")
-    return len(rows)
+        conn.unregister("judged_scope")
+    return inserted
 
 
 def main():
@@ -225,9 +251,11 @@ def main():
     try:
         topk = load_topk_for_judge(conn, db_name, embedding_model, timeline_name=args.timeline or None, top_k=args.top_k)
         print(f"Top-K rows for judge: {len(topk)}")
+        judged_scope = build_judged_task_scope(topk)
+        print(f"Task scope judged: {len(judged_scope)}")
         final_links = build_final_links(topk, cfg, args.progress_every)
         print(f"Final links created: {len(final_links)}")
-        print(f"Final links saved: {save_final_links(conn, db_name, final_links)}")
+        print(f"Final links saved: {save_final_links(conn, db_name, final_links, judged_scope)}")
     finally:
         conn.close()
 

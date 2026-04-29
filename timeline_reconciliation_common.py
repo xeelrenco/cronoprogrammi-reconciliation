@@ -1,7 +1,6 @@
 import hashlib
 import json
 import re
-import struct
 import urllib.request
 from pathlib import Path
 
@@ -73,7 +72,7 @@ def blob_to_float32(blob):
         blob = blob.tobytes()
     if blob is None:
         return np.array([], dtype=np.float32)
-    return np.asarray(struct.unpack(f"{len(blob) // 4}f", blob), dtype=np.float32)
+    return np.frombuffer(blob, dtype=np.float32)
 
 
 def cosine_from_blobs(left_blob, right_blob):
@@ -143,6 +142,34 @@ def embed_text(cfg, text, timeout=60):
     if norm > 0:
         arr = arr / norm
     return arr
+
+
+def embed_texts(cfg, texts, batch_size=256, timeout=60):
+    api_key = cfg.get("LLM_API_KEY", "")
+    if not api_key:
+        raise ValueError("LLM_API_KEY mancante in config.txt")
+    model = cfg.get("EMBEDDING_MODEL", "text-embedding-3-small")
+    base_url = cfg.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    vectors = []
+    for i in range(0, len(texts), batch_size):
+        chunk = [str(x or "") for x in texts[i : i + batch_size]]
+        body = {"model": model, "input": chunk}
+        req = urllib.request.Request(
+            f"{base_url}/embeddings",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)["data"]
+        for item in data:
+            arr = np.asarray(item["embedding"], dtype=np.float32)
+            norm = np.linalg.norm(arr)
+            if norm > 0:
+                arr = arr / norm
+            vectors.append(arr)
+    return vectors
 
 
 def normalize_task_columns(task):

@@ -40,6 +40,7 @@ Il flusso e diviso in script:
 - `2_prepare_timeline_embeddings.py`
   - genera embeddings dei task `ENG_DOC`
   - genera embeddings dei candidati MDR gia `MATCH` verso RACI
+  - usa batching API e refresh incrementale su `TextHash` (ricalcola solo i record cambiati)
   - scrive `TimelineTaskEmbeddings` e `TimelineMdrCandidateEmbeddings`
 - `3_timeline_task_to_mdr_topk.py`
   - calcola cosine similarity task -> MDR candidate
@@ -65,6 +66,13 @@ Per una sola timeline:
 python .\2_prepare_timeline_embeddings.py --timeline "8001 - YEREVAN COMBINED CYCLE POWER PLANT 2"
 python .\3_timeline_task_to_mdr_topk.py --timeline "8001 - YEREVAN COMBINED CYCLE POWER PLANT 2"
 python .\4_judge_timeline_task_mdr_links.py --timeline "8001 - YEREVAN COMBINED CYCLE POWER PLANT 2"
+```
+
+Opzioni utili step 2:
+
+```powershell
+python .\2_prepare_timeline_embeddings.py --embed-batch-size 256
+python .\2_prepare_timeline_embeddings.py --force-refresh
 ```
 
 ## Output

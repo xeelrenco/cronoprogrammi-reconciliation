@@ -19,6 +19,33 @@ def load_task_embeddings(conn, db_name, embedding_model, timeline_name=None):
         params.append(timeline_name)
     return conn.execute(
         f"""
+        WITH e_latest AS (
+            SELECT *
+            FROM (
+                SELECT
+                    e.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY e.TimelineName, e.TaskRowId, e.EmbeddingModel
+                        ORDER BY e.UpdatedAt DESC, e.CreatedAt DESC
+                    ) AS rn
+                FROM {db_name}.timeline_reconciliation.TimelineTaskEmbeddings e
+                {where}
+            ) x
+            WHERE x.rn = 1
+        ),
+        c_latest AS (
+            SELECT *
+            FROM (
+                SELECT
+                    c.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.TimelineName, c.TaskRowId
+                        ORDER BY c.UpdatedAt DESC, c.CreatedAt DESC
+                    ) AS rn
+                FROM {db_name}.timeline_reconciliation.TimelineTasksClassified c
+            ) y
+            WHERE y.rn = 1
+        )
         SELECT
             e.TimelineName,
             e.ProjectCode,
@@ -29,11 +56,10 @@ def load_task_embeddings(conn, db_name, embedding_model, timeline_name=None):
             e.TextHash AS TaskTextHash,
             e.EmbeddingModel,
             e.Embedding
-        FROM {db_name}.timeline_reconciliation.TimelineTaskEmbeddings e
-        JOIN {db_name}.timeline_reconciliation.TimelineTasksClassified c
+        FROM e_latest e
+        JOIN c_latest c
           ON c.TimelineName = e.TimelineName
          AND c.TaskRowId = e.TaskRowId
-        {where}
         ORDER BY e.TimelineName, e.TaskRowId
         """,
         params,
@@ -48,6 +74,20 @@ def load_candidate_embeddings(conn, db_name, embedding_model, timeline_name=None
         params.append(timeline_name)
     return conn.execute(
         f"""
+        WITH latest AS (
+            SELECT *
+            FROM (
+                SELECT
+                    c.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.TimelineName, c.MdrDocumentTitle, c.ConsolidatedTitleKey, c.EmbeddingModel
+                        ORDER BY c.UpdatedAt DESC, c.CreatedAt DESC
+                    ) AS rn
+                FROM {db_name}.timeline_reconciliation.TimelineMdrCandidateEmbeddings c
+                {where}
+            ) x
+            WHERE x.rn = 1
+        )
         SELECT
             TimelineName,
             ProjectCode,
@@ -58,8 +98,7 @@ def load_candidate_embeddings(conn, db_name, embedding_model, timeline_name=None
             TextHash AS CandidateTextHash,
             EmbeddingModel,
             Embedding
-        FROM {db_name}.timeline_reconciliation.TimelineMdrCandidateEmbeddings
-        {where}
+        FROM latest
         ORDER BY TimelineName, MdrDocumentTitle
         """,
         params,
@@ -67,6 +106,8 @@ def load_candidate_embeddings(conn, db_name, embedding_model, timeline_name=None
 
 
 def compute_topk(tasks, candidates, top_k):
+    if tasks.empty or candidates.empty:
+        return pd.DataFrame()
     rows = []
     started = time.time()
     for timeline, task_group in tasks.groupby("TimelineName"):
@@ -74,12 +115,24 @@ def compute_topk(tasks, candidates, top_k):
         if candidate_group.empty:
             print(f"[{timeline}] nessun candidato MDR embedding")
             continue
-        candidate_matrix = np.vstack(candidate_group["Embedding"].apply(blob_to_float32).tolist())
-        for _, task in task_group.iterrows():
-            task_vector = blob_to_float32(task["Embedding"])
-            similarities = candidate_matrix @ task_vector
-            top_indices = np.argsort(-similarities)[:top_k]
-            for rank, cand_idx in enumerate(top_indices, 1):
+        task_matrix = np.vstack(task_group["Embedding"].apply(blob_to_float32).tolist()).astype(np.float32, copy=False)
+        candidate_matrix = np.vstack(candidate_group["Embedding"].apply(blob_to_float32).tolist()).astype(
+            np.float32, copy=False
+        )
+        if task_matrix.shape[1] != candidate_matrix.shape[1]:
+            raise RuntimeError(
+                f"[{timeline}] embedding dim mismatch: tasks {task_matrix.shape[1]} vs candidates {candidate_matrix.shape[1]}"
+            )
+        scores = (task_matrix @ candidate_matrix.T).astype(np.float32, copy=False)
+        effective_k = min(top_k, candidate_matrix.shape[0])
+        for task_pos, (_, task) in enumerate(task_group.iterrows()):
+            similarities = scores[task_pos]
+            if effective_k >= similarities.shape[0]:
+                top_indices = np.argsort(-similarities)
+            else:
+                top_indices = np.argpartition(-similarities, effective_k)[:effective_k]
+                top_indices = top_indices[np.argsort(-similarities[top_indices])]
+            for rank, cand_idx in enumerate(top_indices[:effective_k], 1):
                 cand = candidate_group.iloc[int(cand_idx)]
                 rows.append(
                     {
@@ -106,6 +159,25 @@ def compute_topk(tasks, candidates, top_k):
             f"(elapsed {round(time.time() - started, 1)}s)"
         )
     return pd.DataFrame(rows)
+
+
+def clear_candidates_scope(conn, db_name, embedding_model, timeline_name=None):
+    if timeline_name:
+        conn.execute(
+            f"""
+            DELETE FROM {db_name}.timeline_reconciliation.TimelineTaskToMdrCandidates
+            WHERE EmbeddingModel = ? AND TimelineName = ?
+            """,
+            [embedding_model, timeline_name],
+        )
+    else:
+        conn.execute(
+            f"""
+            DELETE FROM {db_name}.timeline_reconciliation.TimelineTaskToMdrCandidates
+            WHERE EmbeddingModel = ?
+            """,
+            [embedding_model],
+        )
 
 
 def save_candidates(conn, db_name, rows):
@@ -149,6 +221,8 @@ def main():
         candidates = load_candidate_embeddings(conn, db_name, embedding_model, timeline_name=args.timeline or None)
         print(f"Task embeddings: {len(tasks)}")
         print(f"MDR candidate embeddings: {len(candidates)}")
+        clear_candidates_scope(conn, db_name, embedding_model, timeline_name=args.timeline or None)
+        print("Pulizia scope Top-K completata.")
         topk = compute_topk(tasks, candidates, args.top_k)
         print(f"Top-K rows calcolate: {len(topk)}")
         print(f"Top-K rows salvate: {save_candidates(conn, db_name, topk)}")
