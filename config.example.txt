@@ -14,5 +14,6 @@ LLM_PROVIDER=openai
 LLM_API_KEY=
 LLM_MODEL=gpt-4o-mini
 LLM_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small
 LLM_TOP_K_CANDIDATES=5
 LLM_GOOD_SCORE_GAP_THRESHOLD=5

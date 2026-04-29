@@ -4,6 +4,4 @@ Mappatura_MDR_passati.xlsx
 config.txt
 mdr_cache.csv
 __pycache__/
-output_v2/
-v3_task_sample.csv
-output_v3/
+task_sample_limit_10.csv
