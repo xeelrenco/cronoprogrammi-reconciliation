@@ -285,16 +285,45 @@ def build_resolver_prompts(task_group):
         )
 
     system = """
-You resolve whether a Primavera ENG_DOC task should be linked to one or more MDR documents.
+You resolve links between one Primavera schedule task and MDR/RACI document candidates.
 
 Return ONLY valid JSON.
 
-Select zero, one, or multiple candidates from the provided semantic Top-K retrieval set.
-Do not force a match. Return an empty links array when no MDR candidate is credible.
+The task was previously classified as ENG_DOC, but you must still be conservative.
+Select zero, one, or multiple MDR candidates from the provided Top-K list.
 
-Use MDR title as the primary link target. Use RACI title, description, and metadata only as
-semantic context. A task may link to multiple MDR documents when it clearly covers a group
-or package of document deliverables.
+Core rule:
+Link a candidate only if the Primavera task clearly represents progress, issue, review,
+approval, revision, delivery, or update of that specific MDR/RACI document or document group.
+
+Do NOT link when:
+- the candidate is only generally related by discipline, chapter, category, or keywords
+- the task is about procurement/material process rather than document progress
+- the task is about RFQ, technical alignment, commercial alignment, issue of order,
+  purchase order, vendor follow-up, logistics, construction, testing, commissioning,
+  meetings, milestones, or generic project activities
+- the match is only based on broad words such as document, drawing, specification,
+  procedure, engineering, vendor, package, system
+- the candidate title is semantically different from the task title
+
+Use these signals in order:
+1. MDR document title vs task_name_clean
+2. RACI title / description as supporting context
+3. discipline, type, category, chapter only as weak supporting metadata
+4. embedding similarity only as retrieval evidence, never as proof
+
+Multiple links are allowed only when the task clearly covers a bundle/group of documents,
+not merely because several candidates are similar.
+
+If task_class_confidence is LOW, be extra conservative and prefer no links.
+If uncertain, return:
+{"links": []}
+
+Confidence guide:
+- 0.90-1.00: near-certain same document/group
+- 0.75-0.89: strong semantic match with supporting context
+- 0.50-0.74: plausible but not certain
+- below 0.50: do not return the link
 
 JSON schema:
 {
@@ -319,6 +348,7 @@ JSON schema:
             "task_actual_finish_date": str(first.get("TaskActualFinishDate", "")),
             "task_date_fields_json": str(first.get("TaskDateFieldsJson", "")),
             "task_class_reason": str(first.get("TaskClassReason", "")),
+            "task_class_confidence": str(first.get("TaskClassConfidence", "")),
         },
         "candidates": candidates,
     }
@@ -836,8 +866,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--workers", type=int, default=1, help="Worker paralleli per modalita realtime.")
-    parser.add_argument("--min-link-confidence", type=float, default=0.0, help="Scarta link con confidenza inferiore.")
-    parser.add_argument("--max-links-per-task", type=int, default=0, help="0 = nessun limite, altrimenti massimo link per task.")
+    parser.add_argument("--min-link-confidence", type=float, default=0.75, help="Scarta link con confidenza inferiore.")
+    parser.add_argument("--max-links-per-task", type=int, default=3, help="0 = nessun limite, altrimenti massimo link per task.")
     parser.add_argument("--llm-timeout-sec", type=int, default=60)
     parser.add_argument("--retry-max", type=int, default=2)
     parser.add_argument("--retry-backoff-sec", type=float, default=2.0)
