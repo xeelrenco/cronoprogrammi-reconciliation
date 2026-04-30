@@ -49,6 +49,18 @@ HEADERS_TASKS = [
     "ResolverLinkCount",
 ]
 COL_WIDTHS_TASKS = [6, 30, 10, 16, 54, 36, 12, 14, 52, 18, 18, 18, 18, 12]
+HEADERS_CLASSIFY = [
+    "#",
+    "TimelineName",
+    "TaskRowId",
+    "TaskCode",
+    "TaskName",
+    "WbsName",
+    "TaskClass",
+    "TaskClassConfidence",
+    "TaskClassReason",
+]
+COL_WIDTHS_CLASSIFY = [6, 30, 10, 16, 58, 40, 12, 14, 60]
 
 NAVY = "0D1B2A"
 WHITE = "FFFFFF"
@@ -347,21 +359,63 @@ def _build_tasks_sheet(ws, title, rows):
     ws.freeze_panes = "A3"
 
 
+def _build_classify_sheet(ws, title, rows):
+    ws.merge_cells(f"A1:{get_column_letter(len(HEADERS_CLASSIFY))}1")
+    ws["A1"] = f"Timeline Task Classification - {title} | tasks: {len(rows)}"
+    ws["A1"].font = Font(name="Arial", bold=True, size=11, color=WHITE)
+    ws["A1"].fill = _fill(NAVY)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    ws.row_dimensions[1].height = 24
+
+    for idx, (header, width) in enumerate(zip(HEADERS_CLASSIFY, COL_WIDTHS_CLASSIFY), 1):
+        c = ws.cell(row=2, column=idx, value=header)
+        c.font = Font(name="Arial", bold=True, size=9, color=WHITE)
+        c.fill = _fill("1A2E42")
+        c.alignment = _align(center=True)
+        c.border = _border()
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    for i, row in enumerate(rows, 1):
+        excel_row = i + 2
+        task_class = row.get("TaskClass", "")
+        bg = CLASS_BG.get(task_class, "F8FAFC")
+        fg = CLASS_FG.get(task_class, "1A1A2E")
+        values = [
+            i,
+            row["TimelineName"],
+            row["TaskRowId"],
+            row["TaskCode"],
+            row["TaskName"],
+            row["WbsName"],
+            row["TaskClass"],
+            row["TaskClassConfidence"],
+            row["TaskClassReason"],
+        ]
+        for col_idx, value in enumerate(values, 1):
+            c = ws.cell(row=excel_row, column=col_idx, value=_safe_text(value))
+            c.border = _border()
+            c.alignment = _align(center=col_idx in (1, 3, 7, 8))
+            if col_idx in (7, 8):
+                c.fill = _fill(bg)
+                c.font = Font(name="Arial", bold=True, size=9, color=fg)
+            else:
+                c.fill = _fill("FFFFFF")
+                c.font = Font(name="Arial", size=9, color="1A1A2E")
+        ws.row_dimensions[excel_row].height = 58
+
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(HEADERS_CLASSIFY))}{len(rows) + 2}"
+    ws.freeze_panes = "A3"
+
+
 def write_report(link_rows, output_path):
     task_rows = build_task_summary_rows(link_rows)
     wb = Workbook()
-    ws_links = wb.active
-    ws_links.title = "Task-MDR Links"
-    _build_links_sheet(ws_links, "Task-MDR Links", link_rows)
+    ws_classify = wb.active
+    ws_classify.title = "Task + Classify"
+    _build_classify_sheet(ws_classify, "Task + Classify", task_rows)
 
     eng_link_rows = [r for r in link_rows if r.get("TaskClass") == "ENG_DOC"]
-    linked_rows = [r for r in link_rows if r.get("LinkRank", "") != ""]
-    unlinked_rows = [r for r in link_rows if r.get("ResolverLinkCount", 0) == 0]
-
-    _build_links_sheet(wb.create_sheet("ENG_DOC Links"), "ENG_DOC Links", eng_link_rows)
-    _build_links_sheet(wb.create_sheet("Resolved Links"), "Resolved Links", linked_rows)
-    _build_links_sheet(wb.create_sheet("Unlinked Tasks"), "Unlinked Tasks", unlinked_rows)
-    _build_tasks_sheet(wb.create_sheet("Task Summary"), "Task Summary", task_rows)
+    _build_links_sheet(wb.create_sheet("ENG_DOC Full"), "ENG_DOC Full", eng_link_rows)
 
     wb.save(output_path)
 
