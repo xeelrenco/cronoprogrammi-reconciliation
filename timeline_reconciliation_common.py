@@ -57,6 +57,80 @@ def extract_project_code(timeline_name):
     return str(timeline_name)
 
 
+DATE_COLUMN_ALIASES = {
+    "task_start_date": (
+        "start",
+        "start_date",
+        "planned_start",
+        "planned_start_date",
+        "early_start",
+        "early_start_date",
+    ),
+    "task_finish_date": (
+        "finish",
+        "finish_date",
+        "planned_finish",
+        "planned_finish_date",
+        "early_finish",
+        "early_finish_date",
+    ),
+    "task_actual_start_date": (
+        "actual_start",
+        "actual_start_date",
+    ),
+    "task_actual_finish_date": (
+        "actual_finish",
+        "actual_finish_date",
+    ),
+}
+
+
+def normalize_column_name(name):
+    return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+
+
+def serialize_date_value(value):
+    if pd.isna(value):
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def first_matching_date(row, aliases):
+    normalized_columns = {normalize_column_name(c): c for c in row.index}
+    for alias in aliases:
+        original_col = normalized_columns.get(alias)
+        if original_col is None:
+            continue
+        value = row.get(original_col)
+        if not pd.isna(value):
+            return value
+    return None
+
+
+def build_task_date_fields_json(row):
+    out = {}
+    for col in row.index:
+        col_norm = normalize_column_name(col)
+        value = row.get(col)
+        if pd.isna(value):
+            continue
+        is_date_like_value = hasattr(value, "isoformat")
+        is_date_like_name = any(x in col_norm for x in ("date", "start", "finish"))
+        if is_date_like_value or is_date_like_name:
+            out[str(col)] = serialize_date_value(value)
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+def add_task_date_columns(task):
+    out = task.copy()
+    out["task_date_fields_json"] = out.apply(build_task_date_fields_json, axis=1)
+    for target_col, aliases in DATE_COLUMN_ALIASES.items():
+        out[target_col] = out.apply(lambda r: first_matching_date(r, aliases), axis=1)
+    return out
+
+
 def text_hash(text):
     normalized = " ".join(str(text or "").split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -191,14 +265,14 @@ def load_task_with_wbs(prim_file):
     if "wbs_id" not in task.columns:
         task["wbs_name"] = ""
         task["task_row_id"] = task.index
-        return task
+        return add_task_date_columns(task)
     try:
         wbs = pd.read_excel(prim_file, sheet_name="PROJWBS", usecols=["wbs_id", "wbs_name", "wbs_short_name"])
         task = task.merge(wbs, on="wbs_id", how="left")
     except Exception:
         task["wbs_name"] = ""
     task["task_row_id"] = task.index
-    return task
+    return add_task_date_columns(task)
 
 
 def build_task_text(task_name, wbs_name, task_class="ENG_DOC"):

@@ -5,3 +5,6 @@ config.txt
 mdr_cache.csv
 __pycache__/
 task_sample_limit_10.csv
+.timeline_classify_last_batch_ids.json
+.timeline_classify_last_batch_manifest.json
+task_sample_limit_100.csv

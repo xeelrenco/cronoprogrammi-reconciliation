@@ -55,18 +55,6 @@ def load_mdr_candidates(conn, db_name, timeline_name=None):
             WHERE Document_title IS NOT NULL
               AND TRIM(Document_title) <> ''
               {timeline_filter}
-        ),
-        agent_context AS (
-            SELECT
-                Document_title,
-                TitleKey,
-                any_value(EffectiveDescription) AS EffectiveDescription,
-                any_value(DisciplineName) AS DisciplineName,
-                any_value(TypeName) AS TypeName,
-                any_value(CategoryDescription) AS CategoryDescription,
-                any_value(ChapterName) AS ChapterName
-            FROM {db_name}.mdr_reconciliation.v_MdrReconciliationAgentInput
-            GROUP BY Document_title, TitleKey
         )
         SELECT DISTINCT
             m.Mdr_code_name_ref AS TimelineName,
@@ -78,17 +66,18 @@ def load_mdr_candidates(conn, db_name, timeline_name=None):
             c.ConsolidatedConfidence,
             c.ConsolidatedReason,
             c.ConsolidatedSource,
-            a.EffectiveDescription,
-            a.DisciplineName,
-            a.TypeName,
-            a.CategoryDescription,
-            a.ChapterName
+            d.EffectiveDescription,
+            e.DisciplineName,
+            e.TypeName,
+            e.CategoryDescription,
+            e.ChapterName
         FROM {db_name}.mdr_reconciliation.v_MdrReconciliationResults_Consolidated c
         JOIN mdr_docs m
           ON m.Document_title = c.Document_title
-        LEFT JOIN agent_context a
-          ON a.Document_title = c.Document_title
-         AND a.TitleKey = c.ConsolidatedTitleKey
+        LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentTitleDescriptions_Final d
+          ON d.TitleKey = c.ConsolidatedTitleKey
+        LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentsEnriched e
+          ON e.TitleKey = c.ConsolidatedTitleKey
         WHERE c.ConsolidatedDecisionType = 'MATCH'
         ORDER BY TimelineName, MdrDocumentTitle
         """,

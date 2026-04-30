@@ -12,6 +12,11 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTasksClassified
     TaskCode VARCHAR,
     TaskName VARCHAR,
     WbsName VARCHAR,
+    TaskStartDate TIMESTAMP,
+    TaskFinishDate TIMESTAMP,
+    TaskActualStartDate TIMESTAMP,
+    TaskActualFinishDate TIMESTAMP,
+    TaskDateFieldsJson VARCHAR,
     TaskText VARCHAR,
 
     TaskClass VARCHAR,
@@ -24,6 +29,17 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTasksClassified
     UpdatedAt TIMESTAMP DEFAULT NOW(),
     CreatedBy VARCHAR
 );
+
+ALTER TABLE my_db.timeline_reconciliation.TimelineTasksClassified
+ADD COLUMN IF NOT EXISTS TaskStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTasksClassified
+ADD COLUMN IF NOT EXISTS TaskFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTasksClassified
+ADD COLUMN IF NOT EXISTS TaskActualStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTasksClassified
+ADD COLUMN IF NOT EXISTS TaskActualFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTasksClassified
+ADD COLUMN IF NOT EXISTS TaskDateFieldsJson VARCHAR;
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTasksClassified IS
 'Staging table for Primavera timeline task classification. Contains one row per source timeline task and stores the LLM classification ENG_DOC or OTHER before any MDR association is attempted. This is the canonical input table for downstream timeline-to-MDR reconciliation steps.';
@@ -40,6 +56,16 @@ COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskName
 'Original Primavera task/activity name from the TASK sheet.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.WbsName IS
 'Resolved WBS name joined from PROJWBS using wbs_id when available. Used as context for classification and task-to-MDR matching.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskStartDate IS
+'Best-effort planned/scheduled start date extracted from the Primavera TASK sheet, using available start-like columns.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskFinishDate IS
+'Best-effort planned/scheduled finish date extracted from the Primavera TASK sheet, using available finish-like columns.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskActualStartDate IS
+'Best-effort actual start date extracted from the Primavera TASK sheet when available.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskActualFinishDate IS
+'Best-effort actual finish date extracted from the Primavera TASK sheet when available.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskDateFieldsJson IS
+'JSON object containing all non-empty date-like fields detected in the original Primavera TASK row. Used for audit and later date-mapping refinement.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskText IS
 'Prepared text used for downstream semantic matching, typically combining TaskName, WbsName, and TaskClass.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskClass IS
@@ -201,6 +227,11 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrCandid
     TaskRowId BIGINT,
     TaskName VARCHAR,
     WbsName VARCHAR,
+    TaskStartDate TIMESTAMP,
+    TaskFinishDate TIMESTAMP,
+    TaskActualStartDate TIMESTAMP,
+    TaskActualFinishDate TIMESTAMP,
+    TaskDateFieldsJson VARCHAR,
 
     MdrDocumentTitle VARCHAR,
     MdrTitleKey VARCHAR,
@@ -218,6 +249,17 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrCandid
     CreatedBy VARCHAR
 );
 
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates
+ADD COLUMN IF NOT EXISTS TaskStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates
+ADD COLUMN IF NOT EXISTS TaskFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates
+ADD COLUMN IF NOT EXISTS TaskActualStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates
+ADD COLUMN IF NOT EXISTS TaskActualFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates
+ADD COLUMN IF NOT EXISTS TaskDateFieldsJson VARCHAR;
+
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates IS
 'Top-K semantic retrieval candidates from ENG_DOC timeline tasks to MDR documents already consolidated as RACI MATCH. This table is evidence only: Similarity and Rank are retrieval signals, not final business truth.';
 
@@ -231,6 +273,16 @@ COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.Task
 'Original Primavera task name for audit and prompt context.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.WbsName IS
 'Resolved WBS name for audit and prompt context.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskStartDate IS
+'Best-effort planned/scheduled start date carried from TimelineTasksClassified for the retrieved task.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskFinishDate IS
+'Best-effort planned/scheduled finish date carried from TimelineTasksClassified for the retrieved task.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskActualStartDate IS
+'Best-effort actual start date carried from TimelineTasksClassified for the retrieved task.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskActualFinishDate IS
+'Best-effort actual finish date carried from TimelineTasksClassified for the retrieved task.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskDateFieldsJson IS
+'JSON object containing all non-empty date-like source fields for the retrieved task.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.MdrDocumentTitle IS
 'Candidate MDR document title retrieved for the ENG_DOC task.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.MdrTitleKey IS
@@ -268,6 +320,11 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrLinks 
     TaskCode VARCHAR,
     TaskName VARCHAR,
     WbsName VARCHAR,
+    TaskStartDate TIMESTAMP,
+    TaskFinishDate TIMESTAMP,
+    TaskActualStartDate TIMESTAMP,
+    TaskActualFinishDate TIMESTAMP,
+    TaskDateFieldsJson VARCHAR,
 
     TaskClass VARCHAR,
     TaskClassConfidence VARCHAR,
@@ -295,6 +352,16 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrLinks 
 -- If TimelineTaskToMdrLinks already existed from the first draft, add the new link-level explanation column.
 ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
 ADD COLUMN IF NOT EXISTS LinkReason VARCHAR;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
+ADD COLUMN IF NOT EXISTS TaskStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
+ADD COLUMN IF NOT EXISTS TaskFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
+ADD COLUMN IF NOT EXISTS TaskActualStartDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
+ADD COLUMN IF NOT EXISTS TaskActualFinishDate TIMESTAMP;
+ALTER TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks
+ADD COLUMN IF NOT EXISTS TaskDateFieldsJson VARCHAR;
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks IS
 'Final business-facing links from Primavera ENG_DOC timeline tasks to historical MDR documents and their consolidated RACI result. One ENG_DOC task may link to multiple MDR documents, represented as multiple rows. This table should contain final judged links, not raw retrieval candidates.';
@@ -311,6 +378,16 @@ COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskName 
 'Original Primavera task/activity name.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.WbsName IS
 'Resolved WBS name associated with the task.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskStartDate IS
+'Best-effort planned/scheduled start date from the linked Primavera task. This is the primary source for later document schedule estimation.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskFinishDate IS
+'Best-effort planned/scheduled finish date from the linked Primavera task. This is the primary source for later document schedule estimation.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskActualStartDate IS
+'Best-effort actual start date from the linked Primavera task when available.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskActualFinishDate IS
+'Best-effort actual finish date from the linked Primavera task when available.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskDateFieldsJson IS
+'JSON object containing all non-empty date-like source fields for the linked Primavera task, preserved for audit and future date selection rules.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskClass IS
 'Task classification. Final links are normally created only for ENG_DOC tasks.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskClassConfidence IS
@@ -326,7 +403,7 @@ COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkRank 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkScore IS
 'Final confidence or score for the task-to-MDR link, typically assigned by the link evaluation LLM.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkMethod IS
-'Method used to create the final link, for example embedding_topk_llm_judge.';
+'Method used to create the final link, for example embedding_topk_llm_resolver.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkReason IS
 'Short explanation of why the timeline task was linked to this MDR document.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedDecisionType IS

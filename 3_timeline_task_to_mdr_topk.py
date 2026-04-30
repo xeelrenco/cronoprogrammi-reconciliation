@@ -52,6 +52,11 @@ def load_task_embeddings(conn, db_name, embedding_model, timeline_name=None):
             e.TaskRowId,
             c.TaskName,
             c.WbsName,
+            c.TaskStartDate,
+            c.TaskFinishDate,
+            c.TaskActualStartDate,
+            c.TaskActualFinishDate,
+            c.TaskDateFieldsJson,
             e.TaskText,
             e.TextHash AS TaskTextHash,
             e.EmbeddingModel,
@@ -141,6 +146,11 @@ def compute_topk(tasks, candidates, top_k):
                         "TaskRowId": int(task["TaskRowId"]),
                         "TaskName": task["TaskName"],
                         "WbsName": task["WbsName"],
+                        "TaskStartDate": task.get("TaskStartDate"),
+                        "TaskFinishDate": task.get("TaskFinishDate"),
+                        "TaskActualStartDate": task.get("TaskActualStartDate"),
+                        "TaskActualFinishDate": task.get("TaskActualFinishDate"),
+                        "TaskDateFieldsJson": task.get("TaskDateFieldsJson"),
                         "MdrDocumentTitle": cand["MdrDocumentTitle"],
                         "MdrTitleKey": cand["MdrTitleKey"],
                         "ConsolidatedTitleKey": cand["ConsolidatedTitleKey"],
@@ -189,12 +199,16 @@ def save_candidates(conn, db_name, rows):
             f"""
             INSERT INTO {db_name}.timeline_reconciliation.TimelineTaskToMdrCandidates (
                 TimelineName, ProjectCode, TaskRowId, TaskName, WbsName,
+                TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
+                TaskDateFieldsJson,
                 MdrDocumentTitle, MdrTitleKey, ConsolidatedTitleKey, ConsolidatedRaciTitle,
                 Similarity, Rank, EmbeddingModel, RetrievalMethod, TaskTextHash,
                 CandidateTextHash, CreatedBy
             )
             SELECT
                 TimelineName, ProjectCode, TaskRowId, TaskName, WbsName,
+                TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
+                TaskDateFieldsJson,
                 MdrDocumentTitle, MdrTitleKey, ConsolidatedTitleKey, ConsolidatedRaciTitle,
                 Similarity, Rank, EmbeddingModel, RetrievalMethod, TaskTextHash,
                 CandidateTextHash, CreatedBy
