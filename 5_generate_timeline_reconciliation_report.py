@@ -1,4 +1,5 @@
 import argparse
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -25,13 +26,41 @@ HEADERS_LINKS = [
     "LinkReason",
     "MdrDocumentTitle",
     "DocumentRaciTitle",
+    "Resolver LLM — Candidato Top 1",
+    "Resolver LLM — Candidato Top 2",
+    "Resolver LLM — Candidato Top 3",
+    "Resolver LLM — Candidato Top 4",
+    "Resolver LLM — Candidato Top 5",
     "TaskStartDate",
     "TaskFinishDate",
     "TaskActualStartDate",
     "TaskActualFinishDate",
 ]
 
-COL_WIDTHS_LINKS = [6, 28, 10, 16, 44, 30, 12, 14, 42, 9, 52, 42, 38, 18, 18, 18, 18]
+COL_WIDTHS_LINKS = [
+    6,
+    28,
+    10,
+    16,
+    44,
+    30,
+    12,
+    14,
+    42,
+    9,
+    52,
+    42,
+    38,
+    40,
+    40,
+    40,
+    40,
+    40,
+    18,
+    18,
+    18,
+    18,
+]
 HEADERS_TASKS = [
     "#",
     "TimelineName",
@@ -72,6 +101,7 @@ SECTION_COLORS = {
     "task": ("1E40AF", "EFF6FF"),
     "resolver": ("166534", "ECFDF5"),
     "raci": ("6D28D9", "F5F3FF"),
+    "llm_top": ("C2410C", "FFF7ED"),
     "dates": ("475569", "F8FAFC"),
 }
 
@@ -103,7 +133,84 @@ def _safe_text(value):
     return str(value)[:32767]
 
 
-def load_links_rows(conn, db_name, timeline_name=None):
+def _is_na_scalar(val):
+    if val is None:
+        return True
+    try:
+        return bool(pd.isna(val))
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_int(val, default=None):
+    """int(...) che non esplode su NA / NaN / NAType."""
+    if _is_na_scalar(val):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _link_rank_cell(val):
+    """LinkRank per Excel: stringa vuota se assente (righe senza link)."""
+    i = _safe_int(val, default=None)
+    return "" if i is None else i
+
+
+def _fmt_resolver_llm_slot(title, why):
+    """Cell text for one LLM shortlist candidate (title + why_plausible only)."""
+    title = (title or "").strip() or "—"
+    why_str = (why or "").strip()
+    if not why_str:
+        return f"TITOLO (RACI / MDR):\n{title}\n\nNOTA:\n—"
+    return f"TITOLO (RACI / MDR):\n{title}\n\nNOTA:\n{why_str}"
+
+
+def load_llm_top_lookup(conn, db_name, embedding_model, timeline_name=None):
+    """
+    (TimelineName, TaskRowId) -> list of 5 formatted strings (or None per empty slot).
+    """
+    timeline_filter = ""
+    params = [embedding_model]
+    if timeline_name:
+        timeline_filter = "AND TimelineName = ?"
+        params.append(timeline_name)
+    sql = f"""
+    SELECT
+        TimelineName,
+        TaskRowId,
+        CandidateRankWithinResolver,
+        COALESCE(NULLIF(TRIM(ConsolidatedRaciTitle), ''), NULLIF(TRIM(MdrDocumentTitle), '')) AS display_title,
+        WhyPlausible
+    FROM {db_name}.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates
+    WHERE EmbeddingModel = ?
+      AND CandidateRankWithinResolver >= 1
+      AND CandidateRankWithinResolver <= 5
+    {timeline_filter}
+    ORDER BY TimelineName, TaskRowId, CandidateRankWithinResolver
+    """
+    try:
+        df = conn.execute(sql, params).fetchdf()
+    except Exception:
+        return {}
+    lookup = {}
+    for _, row in df.iterrows():
+        tid = _safe_int(row.get("TaskRowId"), default=None)
+        if tid is None:
+            continue
+        key = (_safe_text(row.get("TimelineName")), tid)
+        rank = _safe_int(row.get("CandidateRankWithinResolver"), default=None)
+        if rank is None or rank < 1 or rank > 5:
+            continue
+        txt = _fmt_resolver_llm_slot(row.get("display_title"), row.get("WhyPlausible"))
+        if key not in lookup:
+            lookup[key] = [None] * 5
+        lookup[key][rank - 1] = txt
+    return lookup
+
+
+def load_links_rows(conn, db_name, embedding_model, timeline_name=None, llm_top_lookup=None):
     timeline_filter = ""
     params = []
     if timeline_name:
@@ -179,10 +286,13 @@ def load_links_rows(conn, db_name, timeline_name=None):
 
     rows = []
     for _, row in df.iterrows():
+        tid = _safe_int(row.get("TaskRowId"), default=None)
+        if tid is None:
+            continue
         out = {
             "TimelineName": _safe_text(row.get("TimelineName")),
             "ProjectCode": _safe_text(row.get("ProjectCode")),
-            "TaskRowId": int(row.get("TaskRowId")),
+            "TaskRowId": tid,
             "TaskCode": _safe_text(row.get("TaskCode")),
             "TaskName": _safe_text(row.get("TaskName")),
             "WbsName": _safe_text(row.get("WbsName")),
@@ -193,12 +303,20 @@ def load_links_rows(conn, db_name, timeline_name=None):
             "TaskFinishDate": _fmt_ts(row.get("TaskFinishDate")),
             "TaskActualStartDate": _fmt_ts(row.get("TaskActualStartDate")),
             "TaskActualFinishDate": _fmt_ts(row.get("TaskActualFinishDate")),
-            "ResolverLinkCount": int(row.get("ResolverLinkCount") or 0),
-            "LinkRank": "" if pd.isna(row.get("LinkRank")) else int(row.get("LinkRank")),
+            "ResolverLinkCount": _safe_int(row.get("ResolverLinkCount"), default=0) or 0,
+            "LinkRank": _link_rank_cell(row.get("LinkRank")),
             "LinkReason": _safe_text(row.get("LinkReason")),
             "MdrDocumentTitle": _safe_text(row.get("LinkMdrDocumentTitle")),
             "DocumentRaciTitle": _safe_text(row.get("DocumentRaciTitle")),
         }
+        if llm_top_lookup is not None:
+            key = (out["TimelineName"], out["TaskRowId"])
+            slots = llm_top_lookup.get(key, [None] * 5)
+            for i in range(5):
+                out[f"ResolverLlmTop{i + 1}"] = slots[i] if i < len(slots) else None
+        else:
+            for i in range(5):
+                out[f"ResolverLlmTop{i + 1}"] = None
         rows.append(out)
     return rows
 
@@ -238,7 +356,8 @@ def _build_links_sheet(ws, title, rows):
         ("Task + Classify", 2, 9, "task"),
         ("Resolver Final Link", 10, 12, "resolver"),
         ("MDR to RACI Context", 13, 13, "raci"),
-        ("Task Dates", 14, 17, "dates"),
+        ("Resolver LLM shortlist (max 5)", 14, 18, "llm_top"),
+        ("Task Dates", 19, 22, "dates"),
     ]
     ws.cell(row=2, column=1, value="#")
     ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=1)
@@ -263,7 +382,16 @@ def _build_links_sheet(ws, title, rows):
             ws.column_dimensions[get_column_letter(idx)].width = width
             continue
         c = ws.cell(row=3, column=idx, value=header)
-        section_key = "task" if idx <= 9 else "resolver" if idx <= 12 else "raci" if idx == 13 else "dates"
+        if idx <= 9:
+            section_key = "task"
+        elif idx <= 12:
+            section_key = "resolver"
+        elif idx == 13:
+            section_key = "raci"
+        elif idx <= 18:
+            section_key = "llm_top"
+        else:
+            section_key = "dates"
         header_color, _ = SECTION_COLORS[section_key]
         c.font = Font(name="Arial", bold=True, size=9, color=WHITE)
         c.fill = _fill(header_color)
@@ -291,6 +419,11 @@ def _build_links_sheet(ws, title, rows):
             row["LinkReason"],
             row["MdrDocumentTitle"],
             row["DocumentRaciTitle"],
+            row.get("ResolverLlmTop1") or "—",
+            row.get("ResolverLlmTop2") or "—",
+            row.get("ResolverLlmTop3") or "—",
+            row.get("ResolverLlmTop4") or "—",
+            row.get("ResolverLlmTop5") or "—",
             row["TaskStartDate"],
             row["TaskFinishDate"],
             row["TaskActualStartDate"],
@@ -299,7 +432,7 @@ def _build_links_sheet(ws, title, rows):
         for col_idx, value in enumerate(values, 1):
             c = ws.cell(row=excel_row, column=col_idx, value=_safe_text(value))
             c.border = _border()
-            c.alignment = _align(center=col_idx in (1, 3, 7, 8, 10, 13, 14))
+            c.alignment = _align(center=col_idx in (1, 3, 7, 8, 10, 13, 19))
             if col_idx in (7, 8):
                 c.fill = _fill(class_bg)
                 c.font = Font(name="Arial", bold=True, size=9, color=fg)
@@ -310,10 +443,15 @@ def _build_links_sheet(ws, title, rows):
                     _, cell_color = SECTION_COLORS["resolver"]
                 elif col_idx == 13:
                     _, cell_color = SECTION_COLORS["raci"]
+                elif col_idx <= 18:
+                    _, cell_color = SECTION_COLORS["llm_top"]
                 else:
                     _, cell_color = SECTION_COLORS["dates"]
                 c.fill = _fill(cell_color)
-                c.font = Font(name="Arial", size=9, color="1A1A2E")
+                if 14 <= col_idx <= 18:
+                    c.font = Font(name="Arial", size=9, color="7C2D12")
+                else:
+                    c.font = Font(name="Arial", size=9, color="1A1A2E")
 
         ws.row_dimensions[excel_row].height = 72
 
@@ -424,16 +562,45 @@ def main():
     parser = argparse.ArgumentParser(description="Generate timeline reconciliation Excel report (classify + resolver).")
     parser.add_argument("--timeline", default="", help="Optional TimelineName filter.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output xlsx path.")
+    parser.add_argument(
+        "--embedding-model",
+        default="",
+        help="EmbeddingModel per TimelineTaskToMdrResolverLlmTopCandidates (default: config EMBEDDING_MODEL).",
+    )
     args = parser.parse_args()
 
     cfg = parse_config_txt()
     db_name = cfg.get("MOTHERDUCK_DB", "my_db").strip() or "my_db"
+    embedding_model = (args.embedding_model.strip() or cfg.get("EMBEDDING_MODEL") or "text-embedding-3-small").strip()
     timeline_name = args.timeline.strip() or None
     output_path = Path(args.output).resolve()
 
-    conn = connect_motherduck(cfg)
+    llm_lookup = {}
     try:
-        rows = load_links_rows(conn, db_name, timeline_name=timeline_name)
+        conn = connect_motherduck(cfg)
+    except Exception as exc:
+        err = str(exc).lower()
+        hint = ""
+        if "motherduck" in err or "connection" in err or "download" in err or "establish" in err:
+            hint = (
+                " Suggerimento: controlla la connessione internet, firewall/proxy e che MotherDuck sia "
+                "raggiungibile; riprova tra qualche minuto."
+            )
+        print(
+            f"ERRORE: connessione al database MotherDuck fallita.{hint}\n",
+            f"Dettaglio tecnico: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+    try:
+        llm_lookup = load_llm_top_lookup(conn, db_name, embedding_model, timeline_name=timeline_name)
+        rows = load_links_rows(
+            conn,
+            db_name,
+            embedding_model,
+            timeline_name=timeline_name,
+            llm_top_lookup=llm_lookup,
+        )
     finally:
         conn.close()
 
@@ -445,6 +612,7 @@ def main():
     print(f"ENG_DOC tasks: {sum(1 for r in task_rows if r.get('TaskClass') == 'ENG_DOC')}")
     print(f"OTHER tasks: {sum(1 for r in task_rows if r.get('TaskClass') == 'OTHER')}")
     print(f"Tasks with links: {sum(1 for r in task_rows if r.get('ResolverLinkCount', 0) > 0)}")
+    print(f"Tasks with resolver LLM shortlist in DB: {len(llm_lookup)} (EmbeddingModel={embedding_model})")
 
 
 if __name__ == "__main__":

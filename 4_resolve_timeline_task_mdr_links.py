@@ -2,6 +2,7 @@ import argparse
 import json
 import tempfile
 import time
+from datetime import datetime, timezone
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,8 @@ from timeline_reconciliation_common import CONFIG_FILE, OUTPUT_DIR, chat_json, c
 
 CREATED_BY = "4_resolve_timeline_task_mdr_links.py"
 LINK_METHOD = "embedding_topk_llm_resolver"
+DEFAULT_LLM_SHORTLIST_MAX = 5
+LLM_SHORTLIST_HARD_MAX = 5
 BATCH_IDS_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_ids.json"
 BATCH_MANIFEST_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_manifest.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
@@ -179,6 +182,7 @@ def load_topk_for_resolver(conn, db_name, embedding_model, timeline_name=None, t
             k.MdrTitleKey,
             k.ConsolidatedTitleKey,
             k.ConsolidatedRaciTitle,
+            k.EmbeddingModel,
             k.Similarity,
             k.Rank AS RetrievalRank,
             c.ConsolidatedDecisionType,
@@ -205,7 +209,8 @@ def load_topk_for_resolver(conn, db_name, embedding_model, timeline_name=None, t
     ).fetchdf()
 
 
-def validate_resolver_output(parsed, task_group):
+def validate_resolver_output(parsed, task_group, max_shortlist=DEFAULT_LLM_SHORTLIST_MAX):
+    max_shortlist = max(0, min(int(max_shortlist), LLM_SHORTLIST_HARD_MAX))
     if not isinstance(parsed, dict):
         return _invalid_result("invalid_root", "LLM response root is not a JSON object")
     links = parsed.get("links", [])
@@ -241,15 +246,63 @@ def validate_resolver_output(parsed, task_group):
             }
 
     out_links = list(best_by_candidate.values())
+
+    top_candidates = []
+    raw_top_candidates_count = 0
+    dropped_invalid_top_count = 0
+    duplicate_top_candidates_count = 0
+
+    if max_shortlist > 0:
+        raw_top = parsed.get("top_candidates")
+        if raw_top is None:
+            raw_top = []
+        if not isinstance(raw_top, list):
+            return _invalid_result(
+                "invalid_top_candidates",
+                "LLM response field top_candidates is not a list",
+            )
+        raw_top_candidates_count = len(raw_top)
+        seen_tc = set()
+        for item in raw_top:
+            if len(top_candidates) >= max_shortlist:
+                break
+            if not isinstance(item, dict):
+                dropped_invalid_top_count += 1
+                continue
+            try:
+                cid = int(item.get("candidate_id"))
+            except Exception:
+                dropped_invalid_top_count += 1
+                continue
+            if cid not in valid_ids:
+                dropped_invalid_top_count += 1
+                continue
+            if cid in seen_tc:
+                duplicate_top_candidates_count += 1
+                continue
+            seen_tc.add(cid)
+            top_candidates.append(
+                {
+                    "candidate_id": cid,
+                    "confidence": clamp01(item.get("confidence", 0.0)),
+                    "why_plausible": str(item.get("why_plausible", "") or "")[:500],
+                }
+            )
+
     return {
         "status": "ok",
         "links": out_links,
+        "top_candidates": top_candidates,
         "error_type": "",
         "error_message": "",
         "raw_links_count": len(links),
         "valid_links_count": len(out_links),
         "dropped_invalid_count": dropped_invalid_count,
         "duplicate_candidate_count": duplicate_candidate_count,
+        "raw_top_candidates_count": raw_top_candidates_count,
+        "valid_top_candidates_count": len(top_candidates),
+        "dropped_invalid_top_count": dropped_invalid_top_count,
+        "duplicate_top_candidates_count": duplicate_top_candidates_count,
     }
 
 
@@ -257,12 +310,17 @@ def _invalid_result(error_type, error_message):
     return {
         "status": "invalid_json",
         "links": [],
+        "top_candidates": [],
         "error_type": error_type,
         "error_message": error_message,
         "raw_links_count": 0,
         "valid_links_count": 0,
         "dropped_invalid_count": 0,
         "duplicate_candidate_count": 0,
+        "raw_top_candidates_count": 0,
+        "valid_top_candidates_count": 0,
+        "dropped_invalid_top_count": 0,
+        "duplicate_top_candidates_count": 0,
     }
 
 
@@ -359,7 +417,12 @@ not merely because several candidates are similar.
 
 If task_class_confidence is LOW, be extra conservative and prefer no links.
 If uncertain, return:
-{"links": []}
+{"links": [], "top_candidates": []}
+
+Also return top_candidates: an ordered shortlist of up to 5 distinct candidates (best first)
+that are the most semantically plausible matches from the provided list — even when links is empty.
+Use candidate_id values exactly as in the candidates list. Each entry needs confidence (0-1) and
+why_plausible (brief, factual). Do not invent candidates. If nothing is plausible, use [].
 
 Confidence guide:
 - 0.90-1.00: near-certain same document/group
@@ -374,6 +437,13 @@ JSON schema:
       "candidate_id": 1,
       "confidence": 0.0,
       "reason_short": "brief reason in English"
+    }
+  ],
+  "top_candidates": [
+    {
+      "candidate_id": 1,
+      "confidence": 0.0,
+      "why_plausible": "brief factual justification in English"
     }
   ]
 }
@@ -397,13 +467,20 @@ JSON schema:
     return system, user
 
 
-def resolve_task_links(task_group, cfg, llm_timeout_sec=60, retry_max=0, retry_backoff_sec=2.0):
+def resolve_task_links(
+    task_group,
+    cfg,
+    llm_timeout_sec=60,
+    retry_max=0,
+    retry_backoff_sec=2.0,
+    llm_shortlist_max=DEFAULT_LLM_SHORTLIST_MAX,
+):
     system, user = build_resolver_prompts(task_group)
     last_error = None
     for attempt in range(max(0, retry_max) + 1):
         try:
             parsed = chat_json(cfg, system, user, timeout=llm_timeout_sec)
-            return validate_resolver_output(parsed, task_group)
+            return validate_resolver_output(parsed, task_group, max_shortlist=llm_shortlist_max)
         except Exception as exc:
             last_error = exc
             if attempt < retry_max:
@@ -411,12 +488,17 @@ def resolve_task_links(task_group, cfg, llm_timeout_sec=60, retry_max=0, retry_b
     return {
         "status": "llm_error",
         "links": [],
+        "top_candidates": [],
         "error_type": type(last_error).__name__ if last_error else "llm_error",
         "error_message": str(last_error or "LLM call failed")[:500],
         "raw_links_count": 0,
         "valid_links_count": 0,
         "dropped_invalid_count": 0,
         "duplicate_candidate_count": 0,
+        "raw_top_candidates_count": 0,
+        "valid_top_candidates_count": 0,
+        "dropped_invalid_top_count": 0,
+        "duplicate_top_candidates_count": 0,
     }
 
 
@@ -427,8 +509,10 @@ def build_final_rows_for_group(
     resolved,
     min_link_confidence=0.0,
     max_links_per_task=0,
+    save_llm_top_max=DEFAULT_LLM_SHORTLIST_MAX,
 ):
     rows = []
+    llm_shortlist_rows = []
     first = group.iloc[0]
     scope_all = {"TimelineName": timeline_name, "TaskRowId": int(task_row_id)}
     scope_ok = None
@@ -495,6 +579,40 @@ def build_final_rows_for_group(
                 }
             )
 
+        if save_llm_top_max > 0:
+            created_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            emb = str(first.get("EmbeddingModel") or "")
+            for rank, tc in enumerate((resolved.get("top_candidates") or [])[:save_llm_top_max], 1):
+                cid = int(tc["candidate_id"])
+                match = group[group["RetrievalRank"] == cid]
+                if match.empty:
+                    continue
+                cand = match.iloc[0]
+                llm_shortlist_rows.append(
+                    {
+                        "TimelineName": cand["TimelineName"],
+                        "ProjectCode": cand.get("ProjectCode"),
+                        "TaskRowId": int(cand["TaskRowId"]),
+                        "EmbeddingModel": emb,
+                        "CandidateRankWithinResolver": rank,
+                        "RetrievalRank": cid,
+                        "MdrDocumentTitle": cand.get("MdrDocumentTitle"),
+                        "MdrTitleKey": cand.get("MdrTitleKey"),
+                        "ConsolidatedTitleKey": cand.get("ConsolidatedTitleKey"),
+                        "ConsolidatedRaciTitle": cand.get("ConsolidatedRaciTitle"),
+                        "RetrievalSimilarity": safe_float(cand.get("Similarity")),
+                        "LlmConfidence": safe_float(tc.get("confidence")),
+                        "WhyPlausible": str(tc.get("why_plausible", "") or "")[:500],
+                        "EffectiveDescription": cand.get("EffectiveDescription"),
+                        "DisciplineName": cand.get("DisciplineName"),
+                        "TypeName": cand.get("TypeName"),
+                        "CategoryDescription": cand.get("CategoryDescription"),
+                        "ChapterName": cand.get("ChapterName"),
+                        "CreatedAt": created_ts,
+                        "CreatedBy": CREATED_BY,
+                    }
+                )
+
     diagnostic = {
         "TimelineName": timeline_name,
         "ProjectCode": first.get("ProjectCode"),
@@ -512,7 +630,7 @@ def build_final_rows_for_group(
         "DuplicateCandidateCount": duplicate_candidate_count,
         "CreatedBy": CREATED_BY,
     }
-    return rows, diagnostic, scope_all, scope_ok, status
+    return rows, diagnostic, scope_all, scope_ok, status, llm_shortlist_rows
 
 
 def process_group_realtime(
@@ -523,6 +641,7 @@ def process_group_realtime(
     llm_timeout_sec,
     retry_max,
     retry_backoff_sec,
+    save_llm_top_max=DEFAULT_LLM_SHORTLIST_MAX,
 ):
     (timeline_name, task_row_id), group = item
     resolved = resolve_task_links(
@@ -531,6 +650,7 @@ def process_group_realtime(
         llm_timeout_sec=llm_timeout_sec,
         retry_max=retry_max,
         retry_backoff_sec=retry_backoff_sec,
+        llm_shortlist_max=save_llm_top_max,
     )
     return build_final_rows_for_group(
         timeline_name,
@@ -539,6 +659,7 @@ def process_group_realtime(
         resolved,
         min_link_confidence=min_link_confidence,
         max_links_per_task=max_links_per_task,
+        save_llm_top_max=save_llm_top_max,
     )
 
 
@@ -547,19 +668,22 @@ def combine_group_results(group_results):
     diagnostics = []
     resolved_scope_all = []
     resolved_scope_ok = []
+    llm_top_rows = []
     status_counts = {"ok": 0, "llm_error": 0, "invalid_json": 0}
-    for group_rows, diagnostic, scope_all, scope_ok, status in group_results:
+    for group_rows, diagnostic, scope_all, scope_ok, status, shortlist in group_results:
         rows.extend(group_rows)
         diagnostics.append(diagnostic)
         resolved_scope_all.append(scope_all)
         if scope_ok is not None:
             resolved_scope_ok.append(scope_ok)
+        llm_top_rows.extend(shortlist)
         status_counts[status] = status_counts.get(status, 0) + 1
     return (
         pd.DataFrame(rows),
         pd.DataFrame(diagnostics),
         pd.DataFrame(resolved_scope_all),
         pd.DataFrame(resolved_scope_ok),
+        pd.DataFrame(llm_top_rows),
         status_counts,
     )
 
@@ -574,6 +698,7 @@ def build_final_links(
     retry_max=0,
     retry_backoff_sec=2.0,
     workers=1,
+    save_llm_top_max=DEFAULT_LLM_SHORTLIST_MAX,
 ):
     groups = list(topk.groupby(["TimelineName", "TaskRowId"], sort=True))
     started = time.time()
@@ -590,6 +715,7 @@ def build_final_links(
                     llm_timeout_sec,
                     retry_max,
                     retry_backoff_sec,
+                    save_llm_top_max,
                 )
                 for item in groups
             ]
@@ -608,6 +734,7 @@ def build_final_links(
                     llm_timeout_sec,
                     retry_max,
                     retry_backoff_sec,
+                    save_llm_top_max,
                 )
             )
             if progress_every > 0 and (idx % progress_every == 0 or idx == len(groups)):
@@ -745,7 +872,14 @@ def _wait_batch_completed(cfg, batch_id, poll_interval_sec):
         time.sleep(poll_interval_sec)
 
 
-def collect_batch_results(topk, cfg, min_link_confidence, max_links_per_task, poll_interval_sec):
+def collect_batch_results(
+    topk,
+    cfg,
+    min_link_confidence,
+    max_links_per_task,
+    poll_interval_sec,
+    llm_shortlist_max=DEFAULT_LLM_SHORTLIST_MAX,
+):
     if not BATCH_MANIFEST_FILE.exists():
         raise FileNotFoundError(f"Manifest batch non trovato: {BATCH_MANIFEST_FILE}")
     manifest = json.loads(BATCH_MANIFEST_FILE.read_text(encoding="utf-8"))
@@ -790,7 +924,7 @@ def collect_batch_results(topk, cfg, min_link_confidence, max_links_per_task, po
             text = _extract_batch_text(row)
             try:
                 parsed = _parse_json_text(text)
-                resolved = validate_resolver_output(parsed, group)
+                resolved = validate_resolver_output(parsed, group, max_shortlist=llm_shortlist_max)
             except Exception as exc:
                 resolved = _invalid_result(type(exc).__name__, str(exc)[:500])
             group_results.append(
@@ -801,6 +935,7 @@ def collect_batch_results(topk, cfg, min_link_confidence, max_links_per_task, po
                     resolved,
                     min_link_confidence=min_link_confidence,
                     max_links_per_task=max_links_per_task,
+                    save_llm_top_max=llm_shortlist_max,
                 )
             )
 
@@ -813,12 +948,17 @@ def collect_batch_results(topk, cfg, min_link_confidence, max_links_per_task, po
         resolved = {
             "status": "llm_error",
             "links": [],
+            "top_candidates": [],
             "error_type": "missing_batch_result",
             "error_message": "No output row found for this batch custom_id",
             "raw_links_count": 0,
             "valid_links_count": 0,
             "dropped_invalid_count": 0,
             "duplicate_candidate_count": 0,
+            "raw_top_candidates_count": 0,
+            "valid_top_candidates_count": 0,
+            "dropped_invalid_top_count": 0,
+            "duplicate_top_candidates_count": 0,
         }
         group_results.append(
             build_final_rows_for_group(
@@ -828,6 +968,7 @@ def collect_batch_results(topk, cfg, min_link_confidence, max_links_per_task, po
                 resolved,
                 min_link_confidence=min_link_confidence,
                 max_links_per_task=max_links_per_task,
+                save_llm_top_max=llm_shortlist_max,
             )
         )
 
@@ -902,6 +1043,90 @@ def save_final_links(conn, db_name, rows, resolved_scope):
     return inserted
 
 
+def ensure_resolver_llm_top_candidates_table(conn, db_name):
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {db_name}.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates (
+            TimelineName VARCHAR NOT NULL,
+            ProjectCode VARCHAR,
+            TaskRowId BIGINT NOT NULL,
+            EmbeddingModel VARCHAR NOT NULL,
+            CandidateRankWithinResolver INTEGER NOT NULL,
+            RetrievalRank INTEGER NOT NULL,
+            MdrDocumentTitle VARCHAR,
+            MdrTitleKey VARCHAR,
+            ConsolidatedTitleKey VARCHAR,
+            ConsolidatedRaciTitle VARCHAR,
+            RetrievalSimilarity DOUBLE,
+            LlmConfidence DOUBLE,
+            WhyPlausible VARCHAR,
+            EffectiveDescription VARCHAR,
+            DisciplineName VARCHAR,
+            TypeName VARCHAR,
+            CategoryDescription VARCHAR,
+            ChapterName VARCHAR,
+            CreatedAt TIMESTAMP NOT NULL,
+            CreatedBy VARCHAR,
+            PRIMARY KEY (TimelineName, TaskRowId, EmbeddingModel, CandidateRankWithinResolver)
+        );
+        """
+    )
+
+
+def save_resolver_llm_top_candidates(conn, db_name, rows, task_scope, embedding_model):
+    if task_scope.empty:
+        return 0
+    conn.register("resolver_llm_top_scope", task_scope)
+    try:
+        conn.execute("BEGIN;")
+        conn.execute(
+            f"""
+            DELETE FROM {db_name}.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates t
+            USING resolver_llm_top_scope s
+            WHERE t.TimelineName = s.TimelineName
+              AND t.TaskRowId = s.TaskRowId
+              AND t.EmbeddingModel = ?
+            """,
+            [embedding_model],
+        )
+        inserted = 0
+        if not rows.empty:
+            conn.register("resolver_llm_top_rows", rows)
+            try:
+                conn.execute(
+                    f"""
+                    INSERT INTO {db_name}.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates (
+                        TimelineName, ProjectCode, TaskRowId, EmbeddingModel,
+                        CandidateRankWithinResolver, RetrievalRank,
+                        MdrDocumentTitle, MdrTitleKey, ConsolidatedTitleKey, ConsolidatedRaciTitle,
+                        RetrievalSimilarity, LlmConfidence, WhyPlausible,
+                        EffectiveDescription,
+                        DisciplineName, TypeName, CategoryDescription, ChapterName,
+                        CreatedAt, CreatedBy
+                    )
+                    SELECT
+                        TimelineName, ProjectCode, TaskRowId, EmbeddingModel,
+                        CandidateRankWithinResolver, RetrievalRank,
+                        MdrDocumentTitle, MdrTitleKey, ConsolidatedTitleKey, ConsolidatedRaciTitle,
+                        RetrievalSimilarity, LlmConfidence, WhyPlausible,
+                        EffectiveDescription,
+                        DisciplineName, TypeName, CategoryDescription, ChapterName,
+                        CreatedAt, CreatedBy
+                    FROM resolver_llm_top_rows
+                    """
+                )
+                inserted = len(rows)
+            finally:
+                conn.unregister("resolver_llm_top_rows")
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.unregister("resolver_llm_top_scope")
+    return inserted
+
+
 def main():
     parser = argparse.ArgumentParser(description="4 LLM resolver final timeline task -> MDR links")
     parser.add_argument("--timeline", default="", help="Processa una sola TimelineName.")
@@ -918,7 +1143,19 @@ def main():
     parser.add_argument("--batch-and-collect", action="store_true", help="Submit batch e attende/colleziona nello stesso run.")
     parser.add_argument("--batch-max-bytes", type=int, default=DEFAULT_BATCH_TARGET_BYTES)
     parser.add_argument("--batch-poll-interval", type=int, default=DEFAULT_BATCH_POLL_INTERVAL)
+    parser.add_argument(
+        "--save-llm-top-max",
+        type=int,
+        default=DEFAULT_LLM_SHORTLIST_MAX,
+        help=(
+            "Persisti in DB la shortlist top_candidates del LLM: da 0 a 5 voci per task (0=disattiva salvataggio)."
+        ),
+    )
     args = parser.parse_args()
+    if not (0 <= args.save_llm_top_max <= LLM_SHORTLIST_HARD_MAX):
+        raise RuntimeError(
+            f"--save-llm-top-max deve essere tra 0 e {LLM_SHORTLIST_HARD_MAX} (inclusi)."
+        )
     selected_batch_modes = int(args.batch_submit) + int(args.batch_collect) + int(args.batch_and_collect)
     if selected_batch_modes > 1:
         raise RuntimeError("Usa una sola modalita batch: --batch-submit, --batch-collect oppure --batch-and-collect")
@@ -953,15 +1190,30 @@ def main():
                 return
 
         if args.batch_collect or args.batch_and_collect:
-            final_links, diagnostics, resolved_scope_all, resolved_scope_ok, status_counts = collect_batch_results(
+            (
+                final_links,
+                diagnostics,
+                resolved_scope_all,
+                resolved_scope_ok,
+                llm_top_df,
+                status_counts,
+            ) = collect_batch_results(
                 topk,
                 cfg,
                 args.min_link_confidence,
                 args.max_links_per_task,
                 args.batch_poll_interval,
+                llm_shortlist_max=args.save_llm_top_max,
             )
         else:
-            final_links, diagnostics, resolved_scope_all, resolved_scope_ok, status_counts = build_final_links(
+            (
+                final_links,
+                diagnostics,
+                resolved_scope_all,
+                resolved_scope_ok,
+                llm_top_df,
+                status_counts,
+            ) = build_final_links(
                 topk,
                 cfg,
                 args.progress_every,
@@ -971,6 +1223,7 @@ def main():
                 retry_max=args.retry_max,
                 retry_backoff_sec=args.retry_backoff_sec,
                 workers=args.workers,
+                save_llm_top_max=args.save_llm_top_max,
             )
         print(
             "Resolver status counts: "
@@ -987,6 +1240,16 @@ def main():
             "Final links saved: "
             f"{save_final_links(conn, db_name, final_links, resolved_scope_ok.drop_duplicates())}"
         )
+        if args.save_llm_top_max > 0:
+            ensure_resolver_llm_top_candidates_table(conn, db_name)
+            n_llm_top = save_resolver_llm_top_candidates(
+                conn,
+                db_name,
+                llm_top_df,
+                resolved_scope_ok.drop_duplicates(),
+                embedding_model,
+            )
+            print(f"Resolver LLM top_candidates rows saved: {n_llm_top}")
     finally:
         conn.close()
 

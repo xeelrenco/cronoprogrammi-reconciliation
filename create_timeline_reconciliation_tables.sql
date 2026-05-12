@@ -422,3 +422,38 @@ COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.CreatedAt
 'Timestamp when this final link row was inserted.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.CreatedBy IS
 'Script or process that created this final link row.';
+
+-- ============================================================
+-- 6. Resolver LLM shortlist (model-ranked plausible candidates, like agent top_candidates)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates (
+    TimelineName VARCHAR NOT NULL,
+    ProjectCode VARCHAR,
+    TaskRowId BIGINT NOT NULL,
+    EmbeddingModel VARCHAR NOT NULL,
+    CandidateRankWithinResolver INTEGER NOT NULL,
+    RetrievalRank INTEGER NOT NULL,
+    MdrDocumentTitle VARCHAR,
+    MdrTitleKey VARCHAR,
+    ConsolidatedTitleKey VARCHAR,
+    ConsolidatedRaciTitle VARCHAR,
+    RetrievalSimilarity DOUBLE,
+    LlmConfidence DOUBLE,
+    WhyPlausible VARCHAR,
+    EffectiveDescription VARCHAR,
+    DisciplineName VARCHAR,
+    TypeName VARCHAR,
+    CategoryDescription VARCHAR,
+    ChapterName VARCHAR,
+    CreatedAt TIMESTAMP NOT NULL,
+    CreatedBy VARCHAR,
+    PRIMARY KEY (TimelineName, TaskRowId, EmbeddingModel, CandidateRankWithinResolver)
+);
+
+COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates IS
+'Ordered shortlist from the timeline resolver LLM (top_candidates JSON): most plausible MDR candidates per task, distinct from final chosen links and from raw embedding retrieval ordering.';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.CandidateRankWithinResolver IS
+'1..N LLM preference order within top_candidates (best first).';
+COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.RetrievalRank IS
+'Embedding retrieval rank / resolver candidate_id referencing TimelineTaskToMdrCandidates.';
