@@ -312,6 +312,48 @@ Use these signals in order:
 3. discipline, type, category, chapter only as weak supporting metadata
 4. embedding similarity only as retrieval evidence, never as proof
 
+Rule 1 is MANDATORY and blocking: if the MDR document title does not share
+at least one specific subject concept with task_name_clean (beyond generic words
+like document, drawing, specification, system, engineering), do NOT link
+regardless of embedding similarity or discipline match.
+
+Document type blocking rule:
+When task_name_clean contains a highly specific drawing/document type descriptor
+(e.g. cross sectional, general arrangement, isometric, wiring diagram, hook-up,
+single line diagram, part list, bill of materials), that specific descriptor —
+or a direct synonym or translation — MUST be present in the MDR candidate title.
+Matching only on equipment name or system name is NOT sufficient.
+
+This rule does NOT apply to generic document types such as:
+report, diagram, data sheet, specification, sheet, plan, layout, list, schedule.
+For these, a strong subject/equipment name match is sufficient to allow the link.
+
+Multilingual equivalence: treat the following Italian–English pairs as equivalent
+when comparing task_name_clean to MDR candidate titles:
+- planimetria / plan
+- sezioni / sections
+- percorso / routing
+- schema / diagram
+- relazione / report
+- foglio dati / data sheet
+- capitolato / specification
+- computo / bill of materials
+
+When a task name explicitly lists multiple document types separated by "/" or "and"
+(e.g. "Specification / Data Sheet / IDS"), treat each type independently.
+Link each candidate that matches one of the listed document types — do not require
+a single candidate to cover all types.
+
+Industry acronym equivalence: treat the following as strong title matches
+when they appear in both the task and the candidate:
+- MCC / PMCC / MCC-P (Motor Control Center variants)
+- MV / MT (Medium Voltage)
+- LV / BT (Low Voltage)
+- HV / AT (High Voltage)
+- P&ID / PID
+More generally: if two titles differ only by an industry-standard prefix or
+abbreviation variant referring to the same equipment type, consider them equivalent.
+
 Multiple links are allowed only when the task clearly covers a bundle/group of documents,
 not merely because several candidates are similar.
 
