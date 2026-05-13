@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import re
 import tempfile
 import time
 import uuid
@@ -29,6 +30,34 @@ DEFAULT_SAMPLE_SEED = 42
 DEFAULT_PROGRESS_EVERY = 25
 CREATED_BY = "1_classify_timeline_tasks.py"
 PROMPT_VERSION = "timeline_task_classification_v1"
+# Prefissi in testa al nome task → ENG_DOC senza LLM (allineato a scan_cronoprogrammi_doc_prefixes, senza IFI+/IFT+)
+ENG_DOC_PREFIX_RE = re.compile(
+    r"^(IFI|IFC|IDC|IFR|IFA|IFD|ASB|TRN|IFF|IFT|IFO)\b",
+    re.I,
+)
+
+
+def _clean_task_name_for_prefix(raw: str) -> str:
+    s = (raw or "").strip()
+    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+        s = s[1:-1].strip()
+    return s
+
+
+def try_rule_eng_doc(task_name: str) -> Optional[Dict[str, str]]:
+    """Se il nome inizia con un prefisso documentale noto, classifica ENG_DOC (HIGH) senza LLM."""
+    name = _clean_task_name_for_prefix(str(task_name or ""))
+    if not name:
+        return None
+    m = ENG_DOC_PREFIX_RE.match(name)
+    if not m:
+        return None
+    code = m.group(1).upper()
+    return {
+        "task_class": "ENG_DOC",
+        "confidence": "HIGH",
+        "reason_short": f"Auto: ENG_DOC prefix {code}",
+    }
 BATCH_IDS_FILE = Path(__file__).resolve().parent / ".timeline_classify_last_batch_ids.json"
 BATCH_MANIFEST_FILE = Path(__file__).resolve().parent / ".timeline_classify_last_batch_manifest.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
@@ -115,6 +144,9 @@ def build_or_load_sample_map(tasks_by_file, sample_limit, sample_file, random_se
 
 
 def classify_task(task_name, wbs_name, cfg):
+    ruled = try_rule_eng_doc(task_name)
+    if ruled:
+        return ruled
     system, user = build_classifier_prompts(task_name, wbs_name)
     fallback = {"task_class": "OTHER", "confidence": "LOW", "reason_short": "LLM unavailable or invalid response"}
     try:
@@ -143,8 +175,15 @@ manufacturing, delivery, and generic project activities.
 
 Important:
 - If the activity refers to procurement/material purchasing phases, classify OTHER.
+- Tasks containing "Technical Evaluation", "Tech. Eval." or "TBE" classify as ENG_DOC —
+  they produce formal Technical Bid Evaluation documents present in the RACI matrix.
+- Tasks containing "MTO" (Material Take-Off) classify as ENG_DOC, unless the task
+  is clearly a procurement step (RFQ, PO, BID, order).
 - Use wbs_name only as supporting context, not as the only reason.
 - If uncertain, use OTHER with LOW or MEDIUM confidence.
+- Tasks whose name starts with standard document-control codes (IFC, IFD, IFI, IFR,
+  IFO, IFA, IFT, IFF, IDC, TRN, ASB) are classified by rules before this call;
+  you only see the remaining tasks.
 
 JSON schema:
 {
@@ -316,12 +355,28 @@ def run_batch_submit(task_refs: List[Dict[str, Any]], cfg: Dict[str, str], targe
         )
     if not task_refs:
         return []
+
+    rule_classifications: Dict[str, Dict[str, str]] = {}
+    llm_refs: List[Dict[str, Any]] = []
+    for ref in task_refs:
+        cid = str(ref["custom_id"])
+        ruled = try_rule_eng_doc(str(ref.get("task_name", "")))
+        if ruled:
+            rule_classifications[cid] = ruled
+        else:
+            llm_refs.append(ref)
+
+    print(
+        f"Prefisso doc (auto ENG_DOC): {len(rule_classifications)} | "
+        f"Invio a Batch API: {len(llm_refs)}"
+    )
+
     batch_ids: List[str] = []
     chunks: List[Dict[str, Any]] = []
     current_lines: List[str] = []
     current_ids: List[str] = []
     current_bytes = 0
-    for ref in task_refs:
+    for ref in llm_refs:
         line = _build_batch_line(ref, cfg)
         line_bytes = len((line + "\n").encode("utf-8"))
         if line_bytes > target_max_bytes:
@@ -365,6 +420,7 @@ def run_batch_submit(task_refs: List[Dict[str, Any]], cfg: Dict[str, str], targe
                 "model": cfg.get("LLM_MODEL", "gpt-4o-mini"),
                 "batch_ids": batch_ids,
                 "task_refs": task_refs,
+                "rule_classifications": rule_classifications,
             },
             ensure_ascii=False,
             indent=2,
@@ -392,12 +448,30 @@ def run_batch_collect(cfg: Dict[str, str], poll_interval_sec: int, fill_missing_
     manifest = json.loads(BATCH_MANIFEST_FILE.read_text(encoding="utf-8"))
     batch_ids = manifest.get("batch_ids") or []
     task_refs = manifest.get("task_refs") or []
-    if not batch_ids:
-        print("Nessun batch id nel manifest.")
-        return None
-
     ref_by_custom_id = {str(r["custom_id"]): r for r in task_refs}
     result_by_custom_id: Dict[str, Dict[str, str]] = {}
+    for cid, cls in (manifest.get("rule_classifications") or {}).items():
+        if isinstance(cls, dict) and cls.get("task_class"):
+            result_by_custom_id[str(cid)] = {
+                "task_class": str(cls.get("task_class", "OTHER")).upper(),
+                "confidence": str(cls.get("confidence", "HIGH")).upper(),
+                "reason_short": str(cls.get("reason_short", ""))[:300],
+            }
+
+    if not batch_ids:
+        if not result_by_custom_id and not task_refs:
+            print("Nessun batch id nel manifest e nessuna classificazione a regole.")
+            return None
+        if fill_missing_fallback:
+            for cid in ref_by_custom_id:
+                if cid not in result_by_custom_id:
+                    result_by_custom_id[cid] = {
+                        "task_class": "OTHER",
+                        "confidence": "LOW",
+                        "reason_short": "No batch result found",
+                    }
+        return manifest, result_by_custom_id, []
+
     failed_batch_ids: List[str] = []
     for batch_id in batch_ids:
         batch = _wait_batch_completed(cfg, str(batch_id), poll_interval_sec)
@@ -538,18 +612,10 @@ def run_batch_and_collect_adaptive(
             f"[Adaptive round {round_no}] submit {len(tranche)} task "
             f"(limit={current_limit}, pending={len(pending_by_id)})"
         )
-        batch_ids = run_batch_submit(task_refs=tranche, cfg=cfg, target_max_bytes=target_max_bytes)
-        if not batch_ids:
-            print(f"[Adaptive round {round_no}] nessun batch inviato, applico backoff.")
-            next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
-            if next_limit == current_limit and current_limit > min_limit:
-                next_limit = current_limit - 1
-            current_limit = max(min_limit, next_limit)
-            continue
-
+        run_batch_submit(task_refs=tranche, cfg=cfg, target_max_bytes=target_max_bytes)
         collected = run_batch_collect(cfg=cfg, poll_interval_sec=poll_interval_sec, fill_missing_fallback=False)
         if not collected:
-            print(f"[Adaptive round {round_no}] collect vuoto, applico backoff.")
+            print(f"[Adaptive round {round_no}] collect vuoto o manifest mancante, applico backoff.")
             next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
             if next_limit == current_limit and current_limit > min_limit:
                 next_limit = current_limit - 1
@@ -638,7 +704,14 @@ def build_staging_rows(task, timeline_name, cfg):
             "TaskClass": task["task_class"],
             "TaskClassConfidence": task["classification_confidence"],
             "TaskClassReason": task["classification_reason"],
-            "ClassifierModel": cfg.get("LLM_MODEL", "gpt-4o-mini"),
+            "ClassifierModel": task.apply(
+                lambda r: (
+                    "doc_prefix_rule"
+                    if str(r.get("classification_reason", "")).startswith("Auto: ENG_DOC prefix")
+                    else cfg.get("LLM_MODEL", "gpt-4o-mini")
+                ),
+                axis=1,
+            ),
             "ClassifierPromptVersion": PROMPT_VERSION,
             "CreatedBy": CREATED_BY,
         }
@@ -738,7 +811,8 @@ def main():
         if conn is not None:
             conn.close()
         if not batch_ids:
-            print("Nessun batch inviato.")
+            print("Nessun job OpenAI Batch (tutti i task coperti da prefissi doc o nessuna richiesta LLM).")
+            print(f"Manifest salvato in {BATCH_MANIFEST_FILE.name} — esegui --batch-collect per salvare Excel/DB.")
             return
         print(f"Batch inviati: {len(batch_ids)}")
         print(f"Lista batch salvata in {BATCH_IDS_FILE.name}")
