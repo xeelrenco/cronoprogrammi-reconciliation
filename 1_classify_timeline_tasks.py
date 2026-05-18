@@ -30,9 +30,9 @@ DEFAULT_SAMPLE_SEED = 42
 DEFAULT_PROGRESS_EVERY = 25
 CREATED_BY = "1_classify_timeline_tasks.py"
 PROMPT_VERSION = "timeline_task_classification_v1"
-# Prefissi in testa al nome task → ENG_DOC senza LLM (allineato a scan_cronoprogrammi_doc_prefixes, senza IFI+/IFT+)
+# Token in testa al task_name → ENG_DOC senza LLM (feedback Renco: codici doc + AB/APP/INT; no TRN/RFC/TBE/TE/BCO/EPA)
 ENG_DOC_PREFIX_RE = re.compile(
-    r"^(IFI|IFC|IDC|IFR|IFA|IFD|ASB|TRN|IFF|IFT|IFO)\b",
+    r"^(IFI|IFC|IDC|IFR|IFA|IFD|ASB|IFF|IFT|IFO|AB|APP|INT)\b",
     re.I,
 )
 
@@ -45,7 +45,7 @@ def _clean_task_name_for_prefix(raw: str) -> str:
 
 
 def try_rule_eng_doc(task_name: str) -> Optional[Dict[str, str]]:
-    """Se il nome inizia con un prefisso documentale noto, classifica ENG_DOC (HIGH) senza LLM."""
+    """Se il nome inizia con un token Renco-OK (codice doc o AB/APP/INT), classifica ENG_DOC senza LLM."""
     name = _clean_task_name_for_prefix(str(task_name or ""))
     if not name:
         return None
@@ -175,15 +175,14 @@ manufacturing, delivery, and generic project activities.
 
 Important:
 - If the activity refers to procurement/material purchasing phases, classify OTHER.
-- Tasks containing "Technical Evaluation", "Tech. Eval." or "TBE" classify as ENG_DOC —
-  they produce formal Technical Bid Evaluation documents present in the RACI matrix.
+- Tasks whose name starts with RFC, TBE, TE, BCO, or EPA are usually NOT ENG_DOC
+  (transmittal, bid/technical evaluation, baseline, EPA sessions — not MDR document issue).
 - Tasks containing "MTO" (Material Take-Off) classify as ENG_DOC, unless the task
   is clearly a procurement step (RFQ, PO, BID, order).
 - Use wbs_name only as supporting context, not as the only reason.
 - If uncertain, use OTHER with LOW or MEDIUM confidence.
-- Tasks whose name starts with standard document-control codes (IFC, IFD, IFI, IFR,
-  IFO, IFA, IFT, IFF, IDC, TRN, ASB) are classified by rules before this call;
-  you only see the remaining tasks.
+- Tasks whose name starts with IFC, IFD, IFI, IFR, IFO, IFA, IFT, IFF, IDC, ASB,
+  AB, APP, or INT are classified by rules before this call; you only see the rest.
 
 JSON schema:
 {
