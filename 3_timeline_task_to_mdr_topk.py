@@ -4,7 +4,13 @@ import time
 import numpy as np
 import pandas as pd
 
-from timeline_reconciliation_common import CONFIG_FILE, blob_to_float32, connect_motherduck, parse_config_txt
+from timeline_reconciliation_common import (
+    CONFIG_FILE,
+    blob_to_float32,
+    connect_motherduck,
+    parse_config_txt,
+    raci_dedupe_key,
+)
 
 
 CREATED_BY = "3_timeline_task_to_mdr_topk.py"
@@ -132,12 +138,26 @@ def compute_topk(tasks, candidates, top_k):
         effective_k = min(top_k, candidate_matrix.shape[0])
         for task_pos, (_, task) in enumerate(task_group.iterrows()):
             similarities = scores[task_pos]
-            if effective_k >= similarities.shape[0]:
-                top_indices = np.argsort(-similarities)
-            else:
-                top_indices = np.argpartition(-similarities, effective_k)[:effective_k]
-                top_indices = top_indices[np.argsort(-similarities[top_indices])]
-            for rank, cand_idx in enumerate(top_indices[:effective_k], 1):
+            order = np.argsort(-similarities)
+            seen_keys = set()
+            unique_indices = []
+            for cand_idx in order:
+                if len(unique_indices) >= effective_k:
+                    break
+                cand = candidate_group.iloc[int(cand_idx)]
+                dkey = raci_dedupe_key(
+                    cand.get("ConsolidatedTitleKey"),
+                    cand.get("MdrTitleKey"),
+                    cand.get("ConsolidatedRaciTitle"),
+                    cand.get("MdrDocumentTitle"),
+                )
+                if not dkey:
+                    dkey = f"__cand_{int(cand_idx)}"
+                if dkey in seen_keys:
+                    continue
+                seen_keys.add(dkey)
+                unique_indices.append(int(cand_idx))
+            for rank, cand_idx in enumerate(unique_indices, 1):
                 cand = candidate_group.iloc[int(cand_idx)]
                 rows.append(
                     {

@@ -10,7 +10,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from timeline_reconciliation_common import CONFIG_FILE, OUTPUT_DIR, chat_json, connect_motherduck, parse_config_txt, remove_prefix
+from timeline_reconciliation_common import (
+    CONFIG_FILE,
+    OUTPUT_DIR,
+    chat_json,
+    connect_motherduck,
+    parse_config_txt,
+    raci_dedupe_key,
+    remove_prefix,
+)
 
 
 CREATED_BY = "4_resolve_timeline_task_mdr_links.py"
@@ -34,6 +42,25 @@ def safe_float(value, default=0.0):
 
 def clamp01(value):
     return max(0.0, min(1.0, safe_float(value)))
+
+
+def _raci_key_from_row(row) -> str:
+    key = raci_dedupe_key(
+        row.get("ConsolidatedTitleKey"),
+        row.get("MdrTitleKey"),
+        row.get("ConsolidatedRaciTitle"),
+        row.get("MdrDocumentTitle"),
+    )
+    if key:
+        return key
+    try:
+        return f"cid:{int(row['RetrievalRank'])}"
+    except Exception:
+        return "cid:unknown"
+
+
+def _rank_by_retrieval_id(task_group):
+    return {int(r["RetrievalRank"]): r for _, r in task_group.iterrows()}
 
 
 def _llm_base_url(cfg):
@@ -245,7 +272,22 @@ def validate_resolver_output(parsed, task_group, max_shortlist=DEFAULT_LLM_SHORT
                 "reason_short": reason_short,
             }
 
-    out_links = list(best_by_candidate.values())
+    out_links = sorted(
+        best_by_candidate.values(),
+        key=lambda x: (-safe_float(x.get("confidence", 0.0)), int(x["candidate_id"])),
+    )
+    rank_by_id = _rank_by_retrieval_id(task_group)
+    seen_link_keys = set()
+    deduped_links = []
+    for link in out_links:
+        row = rank_by_id.get(int(link["candidate_id"]))
+        dkey = _raci_key_from_row(row) if row is not None else f"cid:{link['candidate_id']}"
+        if dkey in seen_link_keys:
+            duplicate_candidate_count += 1
+            continue
+        seen_link_keys.add(dkey)
+        deduped_links.append(link)
+    out_links = deduped_links
 
     top_candidates = []
     raw_top_candidates_count = 0
@@ -263,6 +305,7 @@ def validate_resolver_output(parsed, task_group, max_shortlist=DEFAULT_LLM_SHORT
             )
         raw_top_candidates_count = len(raw_top)
         seen_tc = set()
+        seen_top_keys = set()
         for item in raw_top:
             if len(top_candidates) >= max_shortlist:
                 break
@@ -280,7 +323,13 @@ def validate_resolver_output(parsed, task_group, max_shortlist=DEFAULT_LLM_SHORT
             if cid in seen_tc:
                 duplicate_top_candidates_count += 1
                 continue
+            row = rank_by_id.get(cid)
+            dkey = _raci_key_from_row(row) if row is not None else f"cid:{cid}"
+            if dkey in seen_top_keys:
+                duplicate_top_candidates_count += 1
+                continue
             seen_tc.add(cid)
+            seen_top_keys.add(dkey)
             top_candidates.append(
                 {
                     "candidate_id": cid,
@@ -288,6 +337,29 @@ def validate_resolver_output(parsed, task_group, max_shortlist=DEFAULT_LLM_SHORT
                     "why_plausible": str(item.get("why_plausible", "") or "")[:500],
                 }
             )
+        if len(top_candidates) < max_shortlist:
+            pool = task_group.sort_values(
+                ["Similarity", "RetrievalRank"],
+                ascending=[False, True],
+            )
+            for _, row in pool.iterrows():
+                if len(top_candidates) >= max_shortlist:
+                    break
+                cid = int(row["RetrievalRank"])
+                if cid in seen_tc:
+                    continue
+                dkey = _raci_key_from_row(row)
+                if dkey in seen_top_keys:
+                    continue
+                seen_tc.add(cid)
+                seen_top_keys.add(dkey)
+                top_candidates.append(
+                    {
+                        "candidate_id": cid,
+                        "confidence": clamp01(row.get("Similarity", 0.0)),
+                        "why_plausible": "",
+                    }
+                )
 
     return {
         "status": "ok",
@@ -421,8 +493,10 @@ If uncertain, return:
 
 Also return top_candidates: an ordered shortlist of up to 5 distinct candidates (best first)
 that are the most semantically plausible matches from the provided list — even when links is empty.
-Use candidate_id values exactly as in the candidates list. Each entry needs confidence (0-1) and
-why_plausible (brief, factual). Do not invent candidates. If nothing is plausible, use [].
+Use candidate_id values exactly as in the candidates list. At most one candidate_id per consolidated
+RACI document (same raci_title / same document group — do not list multiple ids for the same RACI title).
+Each entry needs confidence (0-1) and why_plausible (brief, factual). Do not invent candidates.
+If nothing is plausible, use [].
 
 Confidence guide:
 - 0.90-1.00: near-certain same document/group

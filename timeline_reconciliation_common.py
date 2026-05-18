@@ -40,6 +40,24 @@ def normalize(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def raci_dedupe_key(
+    consolidated_title_key=None,
+    mdr_title_key=None,
+    consolidated_raci_title=None,
+    mdr_document_title=None,
+):
+    """Chiave stabile per un solo documento RACI logico (dedupe Top-K / shortlist / link)."""
+    for raw in (consolidated_title_key, mdr_title_key):
+        s = ("" if raw is None else str(raw)).strip().lower()
+        if s:
+            return s
+    for raw in (consolidated_raci_title, mdr_document_title):
+        s = normalize(raw)
+        if s:
+            return s
+    return ""
+
+
 def remove_prefix(text):
     if pd.isna(text):
         return ""
