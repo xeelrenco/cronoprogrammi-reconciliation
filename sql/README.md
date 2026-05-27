@@ -1,38 +1,41 @@
-# SQL — schema `timeline_reconciliation`
+# SQL — `timeline_reconciliation` schema
 
-Creazione **da zero** del database usato dalla pipeline cronoprogramma (script `1` … `5`).
+Greenfield DDL for the Primavera timeline ↔ MDR reconciliation pipeline (scripts `1`–`5`).
+
+All `COMMENT ON` metadata is in **English**, tagged for MCP/SQL assistants (`[KEY]`, `[DATE_OPS]`, writers/readers, join hints).
 
 ## File
 
-| File | Contenuto |
-|------|-----------|
-| `00_create_timeline_reconciliation.sql` | Schema, 6 tabelle, 2 view, `COMMENT ON` per tabella/vista/colonna |
+| File | Purpose |
+|------|---------|
+| `00_create_timeline_reconciliation.sql` | `CREATE SCHEMA`, 6 tables, 2 views, full `COMMENT ON` |
 
-## Esecuzione (MotherDuck)
+## Run (MotherDuck)
 
-1. Sostituisci `my_db` nel file se il database in `config.txt` è diverso.
-2. Su database **vuoto** (prima installazione): esegui l’intero script una volta.
-3. Per **ricreare da zero** su DB già popolato:
+1. Replace `my_db` if your `config.txt` uses another database name.
+2. **Empty install:** execute the whole script once.
+3. **Rebuild:**
 
 ```sql
 DROP SCHEMA IF EXISTS my_db.timeline_reconciliation CASCADE;
 ```
 
-Poi riesegui `00_create_timeline_reconciliation.sql` e rilancia la pipeline Python.
+Then re-run `00_create_timeline_reconciliation.sql` and the Python pipeline.
 
-## Mapping script → oggetti
+## Object map (for MCP)
 
-| Script | Tabelle / view |
-|--------|----------------|
-| `1_classify_timeline_tasks.py` | `TimelineTasksClassified` |
-| `2_prepare_timeline_embeddings.py` | `TimelineTaskEmbeddings`, `TimelineMdrCandidateEmbeddings` |
-| `3_timeline_task_to_mdr_topk.py` | `TimelineTaskToMdrCandidates` |
-| `4_resolve_timeline_task_mdr_links.py` | `TimelineTaskToMdrLinks`, `TimelineTaskToMdrResolverLlmTopCandidates` (+ refresh view date via common) |
-| `5_generate_timeline_reconciliation_report.py` | legge tabelle (non le view date) |
-| `timeline_reconciliation_common.py` | `v_TimelineTasksClassified_Dates`, `v_TimelineTaskToMdrLinks_Dates` |
+| Object | Writer script | Primary key / grain |
+|--------|---------------|---------------------|
+| `TimelineTasksClassified` | `1_classify` | `(TimelineName, TaskRowId)` |
+| `TimelineTaskEmbeddings` | `2_prepare` | `(TimelineName, TaskRowId, EmbeddingModel)` |
+| `TimelineMdrCandidateEmbeddings` | `2_prepare` | per timeline + MDR + model |
+| `TimelineTaskToMdrCandidates` | `3_topk` | `(TimelineName, TaskRowId, Rank)` |
+| `TimelineTaskToMdrLinks` | `4_resolve` | link row; latest by `CreatedAt` |
+| `TimelineTaskToMdrResolverLlmTopCandidates` | `4_resolve` | PK on table |
+| `v_TimelineTasksClassified_Dates` | SQL view | classified + actualized |
+| `v_TimelineTaskToMdrLinks_Dates` | SQL view | links + actualized |
 
-## Date (modello v3 minimal)
+## Schedule model (v3)
 
-- **Classified / Links (grezze):** `Early*`, `Actual*`, `Target*`
-- **Links (operative):** `SelectedStartDate`, `SelectedFinishDate` — actualized = `Actual → Early → Target`
-- **View:** `StartActualized`, `FinishActualized` calcolate con la stessa regola
+- **Raw (stored):** `Early*`, `Actual*`, `Target*`
+- **Operational (links):** `SelectedStartDate`, `SelectedFinishDate` = actualized `Actual → Early → Target`

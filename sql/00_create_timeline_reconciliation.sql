@@ -1,28 +1,28 @@
 -- =============================================================================
--- Timeline reconciliation — creazione da zero (MotherDuck / DuckDB)
+-- Timeline reconciliation — greenfield DDL (MotherDuck / DuckDB)
 -- =============================================================================
--- Database di riferimento: my_db  (sostituire se necessario)
+-- Database: my_db (replace if your config uses another name)
 -- Schema: timeline_reconciliation
 --
--- Pipeline Python:
---   1_classify_timeline_tasks.py      → TimelineTasksClassified
---   2_prepare_timeline_embeddings.py  → TimelineTaskEmbeddings, TimelineMdrCandidateEmbeddings
---   3_timeline_task_to_mdr_topk.py      → TimelineTaskToMdrCandidates
---   4_resolve_timeline_task_mdr_links.py → TimelineTaskToMdrLinks, TimelineTaskToMdrResolverLlmTopCandidates
---   5_generate_timeline_reconciliation_report.py → lettura tabelle (report Excel)
+-- Python pipeline (write / read):
+--   1_classify_timeline_tasks.py           → TimelineTasksClassified
+--   2_prepare_timeline_embeddings.py     → TimelineTaskEmbeddings, TimelineMdrCandidateEmbeddings
+--   3_timeline_task_to_mdr_topk.py         → TimelineTaskToMdrCandidates
+--   4_resolve_timeline_task_mdr_links.py   → TimelineTaskToMdrLinks, TimelineTaskToMdrResolverLlmTopCandidates
+--   5_generate_timeline_reconciliation_report.py → reads tables (Excel report; no date views)
 --
--- Ricreazione completa su DB esistente:
+-- Full rebuild on existing DB:
 --   DROP SCHEMA IF EXISTS my_db.timeline_reconciliation CASCADE;
--- poi eseguire di nuovo questo script.
+-- then execute this script.
 -- =============================================================================
 
 CREATE SCHEMA IF NOT EXISTS my_db.timeline_reconciliation;
 
 COMMENT ON SCHEMA my_db.timeline_reconciliation IS
-'Riconciliazione cronoprogramma Primavera ↔ MDR/RACI: classificazione task, embedding, Top-K, link finali LLM. Date v3 minimal (actualized).';
+'Primavera schedule-to-MDR/RACI reconciliation. Pipeline: classify ENG_DOC tasks → embeddings → Top-K retrieval → LLM resolver links. Schedule dates v3: raw Early/Actual/Target + actualized Selected* on links. External MDR source: historical_mdr_normalization + mdr_reconciliation consolidated views.';
 
 -- =============================================================================
--- 1. TimelineTasksClassified — script 1_classify_timeline_tasks.py
+-- 1. TimelineTasksClassified
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTasksClassified (
@@ -55,53 +55,53 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTasksClassified
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTasksClassified IS
-'Una riga per task del cronoprogramma (foglio TASK). Classificazione ENG_DOC / OTHER. Date core per COALESCE actualized (Actual→Early→Target). Input per step 2–4.';
+'Grain: one row per Primavera TASK row. Role: canonical classified task staging. Writer: 1_classify_timeline_tasks.py. Readers: 2_prepare_timeline_embeddings.py, 3_timeline_task_to_mdr_topk.py, 4_resolve_timeline_task_mdr_links.py, 5_generate_timeline_reconciliation_report.py. Natural key: (TimelineName, TaskRowId). Filter ENG_DOC for MDR matching. Schedule: six raw timestamps feed actualized COALESCE Actual→Early→Target.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TimelineName IS
-'Nome timeline (di solito nome file XER/Excel). Filtrare con MDR Mdr_code_name_ref.';
+'[KEY] Primavera timeline / project schedule id; usually XER/Excel file stem. Join/filter: historical MDR Mdr_code_name_ref (textual). Partition all downstream tables by this column.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.ProjectCode IS
-'Codice commessa estratto da TimelineName (es. 7910).';
+'[DERIVED] Project code parsed from TimelineName (e.g. 7910). Reporting only; not a guaranteed MDR join key.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskRowId IS
-'Indice riga nel foglio TASK. Chiave con TimelineName.';
+'[KEY] Source row index in Primavera TASK sheet. With TimelineName forms task identity across pipeline.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskCode IS
-'Codice attività Primavera se presente.';
+'[ATTR] Primavera activity id/code when present in export.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskName IS
-'Nome attività dal cronoprogramma.';
+'[ATTR] Original Primavera activity name from schedule export.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.WbsName IS
-'Nome WBS risolto da PROJWBS.';
+'[ATTR] WBS name resolved from PROJWBS; context for classification and matching.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.EarlyStartDate IS
-'Early start grezzo — 2° priorità in actualized.';
+'[DATE_RAW] Primavera early start. Actualized start COALESCE priority 2 (after Actual, before Target).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.EarlyEndDate IS
-'Early end/finish grezzo — 2° priorità in actualized (fine).';
+'[DATE_RAW] Primavera early finish/end. Actualized finish COALESCE priority 2.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.ActualStartDate IS
-'Actual start grezzo — 1° priorità in actualized.';
+'[DATE_RAW] Primavera actual start when activity has started. Actualized start COALESCE priority 1.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.ActualEndDate IS
-'Actual end grezzo — 1° priorità in actualized (fine).';
+'[DATE_RAW] Primavera actual finish/end when completed. Actualized finish COALESCE priority 1.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TargetStartDate IS
-'Target start grezzo — fallback se Actual e Early assenti.';
+'[DATE_RAW] Primavera target start (common XER fallback). Actualized start COALESCE priority 3.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TargetEndDate IS
-'Target end grezzo — fallback se Actual e Early assenti (fine).';
+'[DATE_RAW] Primavera target end/finish. Actualized finish COALESCE priority 3.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskText IS
-'Testo per embedding/matching (nome task, WBS, classe).';
+'[TEXT] Embedding/classification input: typically task name + WBS + class label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskClass IS
-'ENG_DOC = documento ingegneria; OTHER = escluso dal matching MDR.';
+'[CLASS] ENG_DOC = linkable engineering document task; OTHER = excluded from MDR retrieval/resolver.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskClassConfidence IS
-'HIGH, MEDIUM, LOW.';
+'[CLASS] Classifier confidence: HIGH | MEDIUM | LOW.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.TaskClassReason IS
-'Motivazione breve della classificazione.';
+'[CLASS] Short natural-language justification for TaskClass.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.ClassifierModel IS
-'Modello LLM o regola (es. doc_prefix_rule).';
+'[AUDIT] Model or rule id (e.g. gpt-4o-mini, doc_prefix_rule).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.ClassifierPromptVersion IS
-'Versione prompt classificatore.';
+'[AUDIT] Classifier prompt/version identifier.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.CreatedAt IS
-'Inserimento riga.';
+'[AUDIT] Row insert timestamp.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.UpdatedAt IS
-'Ultimo aggiornamento.';
+'[AUDIT] Last refresh timestamp; use ROW_NUMBER ORDER BY UpdatedAt DESC for latest row per task.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTasksClassified.CreatedBy IS
-'Script creatore (es. 1_classify_timeline_tasks.py).';
+'[AUDIT] Producing script name (expected: 1_classify_timeline_tasks.py).';
 
 -- =============================================================================
--- 2. TimelineTaskEmbeddings — script 2_prepare_timeline_embeddings.py
+-- 2. TimelineTaskEmbeddings
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskEmbeddings (
@@ -121,33 +121,33 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskEmbeddings 
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskEmbeddings IS
-'Embedding vettoriale per task ENG_DOC. Usato dallo step 3 per similarità coseno con candidati MDR.';
+'Grain: one row per (TimelineName, TaskRowId, EmbeddingModel) ENG_DOC task. Role: L2-normalized task vectors for cosine retrieval. Writer: 2_prepare_timeline_embeddings.py. Reader: 3_timeline_task_to_mdr_topk.py. Join parent: TimelineTasksClassified ON (TimelineName, TaskRowId) WHERE TaskClass=ENG_DOC.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.TimelineName IS
-'Timeline del task.';
+'[KEY] Same as TimelineTasksClassified.TimelineName.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.ProjectCode IS
-'Codice commessa.';
+'[DERIVED] Project code from timeline name.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.TaskRowId IS
-'Join a TimelineTasksClassified (TimelineName, TaskRowId).';
+'[KEY] Task row id; join TimelineTasksClassified.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.TaskText IS
-'Testo effettivamente embeddato.';
+'[TEXT] Exact string embedded; must match hash logic in TextHash.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.EmbeddingModel IS
-'Modello embedding (es. text-embedding-3-small).';
+'[KEY] Embedding model id (e.g. text-embedding-3-small); filter retrieval runs by model.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.TextHash IS
-'Hash di TaskText per refresh selettivo.';
+'[AUDIT] SHA256 of normalized TaskText; skip re-embed when unchanged.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.Embedding IS
-'Vettore float32 normalizzato L2 (BLOB).';
+'[VECTOR] float32 L2-normalized embedding bytes (BLOB).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.Dim IS
-'Dimensione vettore.';
+'[VECTOR] Embedding dimension count.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.CreatedAt IS
-'Inserimento.';
+'[AUDIT] Insert time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.UpdatedAt IS
-'Ultimo refresh embedding.';
+'[AUDIT] Last embedding refresh.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskEmbeddings.CreatedBy IS
-'Script creatore (es. 2_prepare_timeline_embeddings.py).';
+'[AUDIT] Expected: 2_prepare_timeline_embeddings.py.';
 
 -- =============================================================================
--- 3. TimelineMdrCandidateEmbeddings — script 2_prepare_timeline_embeddings.py
+-- 3. TimelineMdrCandidateEmbeddings
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings (
@@ -182,57 +182,57 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineMdrCandidateEmb
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings IS
-'Embedding per documenti MDR della stessa timeline con ConsolidatedDecisionType = MATCH (vista MDR consolidata). Pool candidati per Top-K.';
+'Grain: one row per MDR document candidate per timeline and embedding model. Role: MDR-side vectors for Top-K. Writer: 2_prepare_timeline_embeddings.py from mdr_reconciliation.v_MdrReconciliationResults_Consolidated (MATCH only). Reader: 3_timeline_task_to_mdr_topk.py. Join keys: TimelineName + MdrTitleKey / ConsolidatedTitleKey.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.TimelineName IS
-'Timeline = Mdr_code_name_ref del progetto.';
+'[KEY] Must match MDR Mdr_code_name_ref for same project schedule.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ProjectCode IS
-'Codice commessa.';
+'[DERIVED] Parsed project code.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.MdrDocumentTitle IS
-'Titolo documento MDR storico.';
+'[ATTR] Historical MDR Document_title from normalized MDR.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.MdrTitleKey IS
-'Chiave normalizzata titolo MDR.';
+'[KEY] Normalized MDR title key; join raci_matrix.Documents.TitleKey.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedDecisionType IS
-'Di solito MATCH.';
+'[MDR] Final MDR→RACI decision; table populated with MATCH rows only.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedTitleKey IS
-'TitleKey RACI finale.';
+'[KEY] Final RACI TitleKey from consolidated reconciliation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedRaciTitle IS
-'Titolo RACI finale.';
+'[ATTR] Final RACI document title.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedConfidence IS
-'Confidenza consolidata MDR→RACI.';
+'[MDR] Consolidated match confidence score.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedReason IS
-'Motivo decisione consolidata.';
+'[MDR] Consolidated decision rationale text.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ConsolidatedSource IS
-'Origine (es. judge_3_3, recovery_3_4).';
+'[MDR] Provenance layer: judge_3_3 | recovery_3_4 etc.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.EffectiveDescription IS
-'Descrizione RACI effettiva per il retrieval.';
+'[TEXT] RACI description used in CandidateText (manual override preferred).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.DisciplineName IS
-'Disciplina RACI (testo).';
+'[RACI_META] Human-readable discipline.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.TypeName IS
-'Tipo documento RACI.';
+'[RACI_META] Document type label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.CategoryDescription IS
-'Categoria RACI.';
+'[RACI_META] Category description.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.ChapterName IS
-'Capitolo RACI.';
+'[RACI_META] Chapter name.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.CandidateText IS
-'Testo embeddato (MDR + contesto RACI).';
+'[TEXT] Full text embedded (MDR title + RACI context).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.EmbeddingModel IS
-'Modello embedding.';
+'[KEY] Embedding model; must match task embeddings for similarity.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.TextHash IS
-'Hash CandidateText.';
+'[AUDIT] Hash of CandidateText for incremental refresh.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.Embedding IS
-'Vettore float32 (BLOB).';
+'[VECTOR] float32 L2-normalized BLOB.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.Dim IS
-'Dimensione vettore.';
+'[VECTOR] Dimension.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.CreatedAt IS
-'Inserimento.';
+'[AUDIT] Insert time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.UpdatedAt IS
-'Ultimo refresh.';
+'[AUDIT] Last refresh.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineMdrCandidateEmbeddings.CreatedBy IS
-'Script creatore.';
+'[AUDIT] Expected: 2_prepare_timeline_embeddings.py.';
 
 -- =============================================================================
--- 4. TimelineTaskToMdrCandidates — script 3_timeline_task_to_mdr_topk.py
+-- 4. TimelineTaskToMdrCandidates
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrCandidates (
@@ -260,45 +260,45 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrCandid
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrCandidates IS
-'Top-K retrieval semantico task ENG_DOC → MDR. Solo evidenza; non è la verità di business (vedi Links).';
+'Grain: one row per (TimelineName, TaskRowId, Rank) within Top-K retrieval. Role: retrieval evidence only — not final business truth (see TimelineTaskToMdrLinks). Writer: 3_timeline_task_to_mdr_topk.py. Reader: 4_resolve_timeline_task_mdr_links.py. No schedule date columns by design.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TimelineName IS
-'Timeline del task.';
+'[KEY] Timeline scope for retrieval.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.ProjectCode IS
-'Codice commessa.';
+'[DERIVED] Project code.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskRowId IS
-'Task sorgente.';
+'[KEY] ENG_DOC task id; join TimelineTasksClassified / TimelineTaskEmbeddings.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskName IS
-'Nome task (audit).';
+'[ATTR] Task name snapshot for LLM/audit.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.WbsName IS
-'WBS (audit).';
+'[ATTR] WBS snapshot for audit.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.MdrDocumentTitle IS
-'Titolo MDR candidato.';
+'[ATTR] Retrieved MDR document title.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.MdrTitleKey IS
-'Chiave MDR.';
+'[KEY] Normalized MDR title key.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.ConsolidatedTitleKey IS
-'TitleKey RACI del candidato.';
+'[KEY] RACI TitleKey for candidate.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.ConsolidatedRaciTitle IS
-'Titolo RACI del candidato.';
+'[ATTR] RACI title for candidate.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.Similarity IS
-'Similarità coseno (0–1).';
+'[SCORE] Cosine similarity in [0,1]; higher = closer embedding match.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.Rank IS
-'Rank nel Top-K per (TimelineName, TaskRowId); 1 = migliore.';
+'[RANK] Retrieval order per task; Rank=1 is best similarity. Maps to resolver candidate_id.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.EmbeddingModel IS
-'Modello embedding usato.';
+'[KEY] Embedding model used for this retrieval run.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.RetrievalMethod IS
-'Metodo (es. embedding_cosine_topk).';
+'[AUDIT] Method tag (e.g. embedding_cosine_topk).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.TaskTextHash IS
-'Tracciabilità verso TimelineTaskEmbeddings.';
+'[AUDIT] Links to TimelineTaskEmbeddings.TextHash.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.CandidateTextHash IS
-'Tracciabilità verso TimelineMdrCandidateEmbeddings.';
+'[AUDIT] Links to TimelineMdrCandidateEmbeddings.TextHash.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.CreatedAt IS
-'Inserimento.';
+'[AUDIT] Insert time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrCandidates.CreatedBy IS
-'Script creatore (es. 3_timeline_task_to_mdr_topk.py).';
+'[AUDIT] Expected: 3_timeline_task_to_mdr_topk.py.';
 
 -- =============================================================================
--- 5. TimelineTaskToMdrLinks — script 4_resolve_timeline_task_mdr_links.py
+-- 5. TimelineTaskToMdrLinks
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrLinks (
@@ -343,73 +343,73 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrLinks 
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrLinks IS
-'Link finali task ENG_DOC ↔ documento MDR. Più righe per task se più documenti. Date operative in Selected* (actualized).';
+'Grain: one row per accepted task-to-MDR link (multiple rows per task if multiple MDRs). Role: final business links after LLM resolver. Writer: 4_resolve_timeline_task_mdr_links.py. Readers: 5_generate_timeline_reconciliation_report.py, analytics. Operational schedule dates: SelectedStartDate/SelectedFinishDate (actualized). Raw schedule copies preserved for audit. Latest link per (TimelineName, TaskRowId, MdrTitleKey): ORDER BY CreatedAt DESC.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TimelineName IS
-'Timeline sorgente.';
+'[KEY] Timeline identifier.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ProjectCode IS
-'Codice commessa.';
+'[DERIVED] Project code.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskRowId IS
-'Task cronoprogramma.';
+'[KEY] Primavera task row.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskCode IS
-'Codice attività.';
+'[ATTR] Activity code at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskName IS
-'Nome attività.';
+'[ATTR] Activity name at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.WbsName IS
-'WBS.';
+'[ATTR] WBS at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.EarlyStartDate IS
-'Snapshot early start al momento del link.';
+'[DATE_RAW] Snapshot from classified task at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.EarlyEndDate IS
-'Snapshot early end al momento del link.';
+'[DATE_RAW] Snapshot early end at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ActualStartDate IS
-'Snapshot actual start al momento del link.';
+'[DATE_RAW] Snapshot actual start at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ActualEndDate IS
-'Snapshot actual end al momento del link.';
+'[DATE_RAW] Snapshot actual end at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TargetStartDate IS
-'Snapshot target start al momento del link.';
+'[DATE_RAW] Snapshot target start at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TargetEndDate IS
-'Snapshot target end al momento del link.';
+'[DATE_RAW] Snapshot target end at link creation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.SelectedStartDate IS
-'Data inizio actualized (Actual→Early→Target) — uso operativo: ordine documenti, giorni/uomo.';
+'[DATE_OPS] Business start date: actualized COALESCE(ActualStart, EarlyStart, TargetStart) frozen at link time. Use for document sequencing and man-day duration (with SelectedFinishDate).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.SelectedFinishDate IS
-'Data fine actualized (Actual→Early→Target).';
+'[DATE_OPS] Business finish date: actualized COALESCE(ActualEnd, EarlyEnd, TargetEnd) frozen at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskClass IS
-'Classe task (di solito ENG_DOC).';
+'[CLASS] Usually ENG_DOC for rows in this table.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskClassConfidence IS
-'Confidenza classificazione.';
+'[CLASS] Classifier confidence copied at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.TaskClassReason IS
-'Motivo classificazione.';
+'[CLASS] Classifier reason copied at link time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.MdrDocumentTitle IS
-'Titolo MDR collegato.';
+'[ATTR] Linked historical MDR title.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.MdrTitleKey IS
-'Chiave MDR collegato.';
+'[KEY] Linked MDR title key; with TimelineName+TaskRowId identifies link set.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkRank IS
-'Priorità tra link dello stesso task (1 = preferito).';
+'[RANK] Preference among links for same task; 1 = primary link.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkScore IS
-'Confidenza LLM del link.';
+'[SCORE] LLM resolver confidence for this link.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkMethod IS
-'Metodo (es. embedding_topk_llm_resolver).';
+'[AUDIT] Resolver method (e.g. embedding_topk_llm_resolver).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.LinkReason IS
-'Motivazione breve del link.';
+'[TEXT] Short LLM explanation for accepting this MDR association.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedDecisionType IS
-'Decisione MDR→RACI (MATCH atteso).';
+'[MDR] Expected MATCH from MDR→RACI consolidation.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedTitleKey IS
-'TitleKey RACI finale.';
+'[KEY] RACI TitleKey for linked document.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedRaciTitle IS
-'Titolo RACI finale.';
+'[ATTR] RACI title for linked document.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedConfidence IS
-'Confidenza consolidata.';
+'[MDR] Consolidated reconciliation confidence.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedReason IS
-'Motivo consolidato.';
+'[MDR] Consolidated reconciliation reason.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.ConsolidatedSource IS
-'Layer consolidamento (judge_3_3 / recovery_3_4).';
+'[MDR] Consolidated layer source (judge_3_3, recovery_3_4, …).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.CreatedAt IS
-'Inserimento link.';
+'[AUDIT] Link row insert time; use for latest-link queries.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrLinks.CreatedBy IS
-'Script creatore (es. 4_resolve_timeline_task_mdr_links.py).';
+'[AUDIT] Expected: 4_resolve_timeline_task_mdr_links.py.';
 
 -- =============================================================================
--- 6. TimelineTaskToMdrResolverLlmTopCandidates — script 4 (shortlist LLM)
+-- 6. TimelineTaskToMdrResolverLlmTopCandidates
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates (
@@ -437,51 +437,51 @@ CREATE TABLE IF NOT EXISTS my_db.timeline_reconciliation.TimelineTaskToMdrResolv
 );
 
 COMMENT ON TABLE my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates IS
-'Shortlist ordinata dal resolver LLM (top_candidates), distinta dai link finali e dal rank di retrieval.';
+'Grain: up to N LLM-ranked plausible MDR candidates per task per embedding model (PK includes CandidateRankWithinResolver). Role: resolver shortlist audit — not final links. Writer: 4_resolve_timeline_task_mdr_links.py. Reader: 5_generate_timeline_reconciliation_report.py. Join TimelineTaskToMdrCandidates via RetrievalRank = Rank.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.TimelineName IS
-'Timeline del task.';
+'[PK] Timeline scope.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.ProjectCode IS
-'Codice commessa.';
+'[DERIVED] Project code.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.TaskRowId IS
-'Task sorgente.';
+'[PK] Task row id.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.EmbeddingModel IS
-'Modello embedding della run resolver.';
+'[PK] Resolver run embedding model.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.CandidateRankWithinResolver IS
-'Ordine preferenza LLM (1 = migliore) nella shortlist.';
+'[PK][RANK] LLM preference order in top_candidates JSON (1 = best).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.RetrievalRank IS
-'Rank nel Top-K retrieval (candidate_id verso TimelineTaskToMdrCandidates).';
+'[FK] References TimelineTaskToMdrCandidates.Rank (resolver candidate_id).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.MdrDocumentTitle IS
-'Titolo MDR candidato.';
+'[ATTR] MDR title for shortlist row.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.MdrTitleKey IS
-'Chiave MDR.';
+'[ATTR] MDR key.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.ConsolidatedTitleKey IS
-'TitleKey RACI.';
+'[ATTR] RACI TitleKey.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.ConsolidatedRaciTitle IS
-'Titolo RACI.';
+'[ATTR] RACI title.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.RetrievalSimilarity IS
-'Similarità embedding al momento del retrieval.';
+'[SCORE] Embedding similarity at retrieval time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.LlmConfidence IS
-'Confidenza LLM sulla plausibilità del candidato.';
+'[SCORE] LLM confidence for plausibility of this candidate.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.WhyPlausible IS
-'Testo LLM: perché il candidato è plausibile.';
+'[TEXT] LLM rationale (why_plausible).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.EffectiveDescription IS
-'Descrizione RACI usata nel contesto.';
+'[TEXT] RACI description shown to resolver.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.DisciplineName IS
-'Disciplina RACI.';
+'[RACI_META] Discipline label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.TypeName IS
-'Tipo documento.';
+'[RACI_META] Type label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.CategoryDescription IS
-'Categoria.';
+'[RACI_META] Category label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.ChapterName IS
-'Capitolo.';
+'[RACI_META] Chapter label.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.CreatedAt IS
-'Timestamp inserimento shortlist.';
+'[AUDIT] Shortlist persist time.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.TimelineTaskToMdrResolverLlmTopCandidates.CreatedBy IS
-'Script creatore.';
+'[AUDIT] Expected: 4_resolve_timeline_task_mdr_links.py.';
 
 -- =============================================================================
--- 7. View date — timeline_reconciliation_common.refresh_* (e analisi SQL)
+-- 7. Views — schedule actualized (optional SQL analytics)
 -- =============================================================================
 
 CREATE OR REPLACE VIEW my_db.timeline_reconciliation.v_TimelineTasksClassified_Dates AS
@@ -492,12 +492,12 @@ SELECT
 FROM my_db.timeline_reconciliation.TimelineTasksClassified AS c;
 
 COMMENT ON VIEW my_db.timeline_reconciliation.v_TimelineTasksClassified_Dates IS
-'Classified + StartActualized/FinishActualized (Actual→Early→Target).';
+'Extends TimelineTasksClassified with computed actualized dates. Formula: StartActualized=COALESCE(ActualStart,EarlyStart,TargetStart); FinishActualized=COALESCE(ActualEnd,EarlyEnd,TargetEnd). Refreshed by timeline_reconciliation_common.refresh_timeline_classified_dates_view(). Report script 5 reads base table directly, not this view.';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.v_TimelineTasksClassified_Dates.StartActualized IS
-'Inizio actualized calcolato da grezze.';
+'[COMPUTED] Actualized start from raw columns on same row; same rule as SelectedStartDate on links.';
 COMMENT ON COLUMN my_db.timeline_reconciliation.v_TimelineTasksClassified_Dates.FinishActualized IS
-'Fine actualized calcolata da grezze.';
+'[COMPUTED] Actualized finish from raw columns on same row.';
 
 CREATE OR REPLACE VIEW my_db.timeline_reconciliation.v_TimelineTaskToMdrLinks_Dates AS
 SELECT
@@ -507,9 +507,9 @@ SELECT
 FROM my_db.timeline_reconciliation.TimelineTaskToMdrLinks AS l;
 
 COMMENT ON VIEW my_db.timeline_reconciliation.v_TimelineTaskToMdrLinks_Dates IS
-'Link finali + date actualized (Selected* o COALESCE grezze).';
+'Extends TimelineTaskToMdrLinks with StartActualized/FinishActualized. Prefers persisted Selected*; else recomputes from raw snapshots. Refreshed by refresh_timeline_links_dates_view().';
 
 COMMENT ON COLUMN my_db.timeline_reconciliation.v_TimelineTaskToMdrLinks_Dates.StartActualized IS
-'Inizio actualized: SelectedStartDate se presente, altrimenti COALESCE grezze.';
+'[COMPUTED] COALESCE(SelectedStartDate, ActualStart, EarlyStart, TargetStart).';
 COMMENT ON COLUMN my_db.timeline_reconciliation.v_TimelineTaskToMdrLinks_Dates.FinishActualized IS
-'Fine actualized: SelectedFinishDate se presente, altrimenti COALESCE grezze.';
+'[COMPUTED] COALESCE(SelectedFinishDate, ActualEnd, EarlyEnd, TargetEnd).';
