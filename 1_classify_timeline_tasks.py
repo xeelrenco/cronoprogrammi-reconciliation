@@ -15,14 +15,15 @@ from timeline_reconciliation_common import (
     CONFIG_FILE,
     CRONOPROGRAMMI_DIR,
     OUTPUT_DIR,
+    PRIMERA_ALL_SCHEDULE_FIELDS,
     build_task_text,
     chat_json,
+    classified_row_dates_for_ref,
     connect_motherduck,
     extract_project_code,
     load_task_with_wbs,
     parse_config_txt,
     remove_prefix,
-    serialize_date_value,
 )
 
 
@@ -329,21 +330,17 @@ def _flatten_tasks_for_batch(tasks_by_file, sample_map=None):
             continue
         for _, row in selected.iterrows():
             task_row_id = int(row["task_row_id"])
-            task_refs.append(
-                {
-                    "timeline_name": timeline,
-                    "task_row_id": task_row_id,
-                    "task_code": row.get("task_code"),
-                    "task_name": str(row.get("task_name", "")),
-                    "wbs_name": str(row.get("wbs_name", "")),
-                    "task_start_date": serialize_date_value(row.get("task_start_date")),
-                    "task_finish_date": serialize_date_value(row.get("task_finish_date")),
-                    "task_actual_start_date": serialize_date_value(row.get("task_actual_start_date")),
-                    "task_actual_finish_date": serialize_date_value(row.get("task_actual_finish_date")),
-                    "task_date_fields_json": row.get("task_date_fields_json"),
-                    "custom_id": f"{timeline}::{task_row_id}",
-                }
-            )
+            ref = {
+                "timeline_name": timeline,
+                "task_row_id": task_row_id,
+                "task_code": row.get("task_code"),
+                "task_name": str(row.get("task_name", "")),
+                "wbs_name": str(row.get("wbs_name", "")),
+                "task_date_fields_json": row.get("task_date_fields_json"),
+                "custom_id": f"{timeline}::{task_row_id}",
+            }
+            ref.update(classified_row_dates_for_ref(row))
+            task_refs.append(ref)
     return task_refs
 
 
@@ -536,22 +533,19 @@ def persist_classification_outputs(
             custom_id,
             {"task_class": "OTHER", "confidence": "LOW", "reason_short": "No batch result found"},
         )
-        grouped_rows.setdefault(timeline, []).append(
-            {
-                "task_row_id": int(ref.get("task_row_id")),
-                "task_code": ref.get("task_code"),
-                "task_name": ref.get("task_name"),
-                "wbs_name": ref.get("wbs_name"),
-                "task_start_date": ref.get("task_start_date"),
-                "task_finish_date": ref.get("task_finish_date"),
-                "task_actual_start_date": ref.get("task_actual_start_date"),
-                "task_actual_finish_date": ref.get("task_actual_finish_date"),
-                "task_date_fields_json": ref.get("task_date_fields_json"),
-                "task_class": cls["task_class"],
-                "classification_confidence": cls["confidence"],
-                "classification_reason": cls["reason_short"],
-            }
-        )
+        row_payload = {
+            "task_row_id": int(ref.get("task_row_id")),
+            "task_code": ref.get("task_code"),
+            "task_name": ref.get("task_name"),
+            "wbs_name": ref.get("wbs_name"),
+            "task_date_fields_json": ref.get("task_date_fields_json"),
+            "task_class": cls["task_class"],
+            "classification_confidence": cls["confidence"],
+            "classification_reason": cls["reason_short"],
+        }
+        for snake, _ in PRIMERA_ALL_SCHEDULE_FIELDS:
+            row_payload[snake] = ref.get(snake)
+        grouped_rows.setdefault(timeline, []).append(row_payload)
 
     saved_rows = 0
     for timeline, rows in grouped_rows.items():
@@ -559,18 +553,9 @@ def persist_classification_outputs(
         out_path = OUTPUT_DIR / f"classification_{timeline}.xlsx"
         with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
             classified[
-                [
-                    "task_code",
-                    "task_name",
-                    "wbs_name",
-                    "task_start_date",
-                    "task_finish_date",
-                    "task_actual_start_date",
-                    "task_actual_finish_date",
-                    "task_class",
-                    "classification_confidence",
-                    "classification_reason",
-                ]
+                ["task_code", "task_name", "wbs_name"]
+                + [snake for snake, _ in PRIMERA_ALL_SCHEDULE_FIELDS]
+                + ["task_class", "classification_confidence", "classification_reason"]
             ].to_excel(writer, sheet_name="Task_LLM_classification", index=False)
         print(f"Creato: {out_path}")
         if conn is not None:
@@ -686,35 +671,31 @@ def classify_tasks(task, cfg, file_label="", progress_every=DEFAULT_PROGRESS_EVE
 
 
 def build_staging_rows(task, timeline_name, cfg):
-    return pd.DataFrame(
-        {
-            "TimelineName": timeline_name,
-            "ProjectCode": extract_project_code(timeline_name),
-            "TaskRowId": task["task_row_id"],
-            "TaskCode": task.get("task_code"),
-            "TaskName": task.get("task_name"),
-            "WbsName": task.get("wbs_name"),
-            "TaskStartDate": task.get("task_start_date"),
-            "TaskFinishDate": task.get("task_finish_date"),
-            "TaskActualStartDate": task.get("task_actual_start_date"),
-            "TaskActualFinishDate": task.get("task_actual_finish_date"),
-            "TaskDateFieldsJson": task.get("task_date_fields_json"),
-            "TaskText": task.apply(lambda r: build_task_text(r.get("task_name"), r.get("wbs_name"), r.get("task_class")), axis=1),
-            "TaskClass": task["task_class"],
-            "TaskClassConfidence": task["classification_confidence"],
-            "TaskClassReason": task["classification_reason"],
-            "ClassifierModel": task.apply(
-                lambda r: (
-                    "doc_prefix_rule"
-                    if str(r.get("classification_reason", "")).startswith("Auto: ENG_DOC prefix")
-                    else cfg.get("LLM_MODEL", "gpt-4o-mini")
-                ),
-                axis=1,
+    payload = {
+        "TimelineName": timeline_name,
+        "ProjectCode": extract_project_code(timeline_name),
+        "TaskRowId": task["task_row_id"],
+        "TaskCode": task.get("task_code"),
+        "TaskName": task.get("task_name"),
+        "WbsName": task.get("wbs_name"),
+        "TaskText": task.apply(lambda r: build_task_text(r.get("task_name"), r.get("wbs_name"), r.get("task_class")), axis=1),
+        "TaskClass": task["task_class"],
+        "TaskClassConfidence": task["classification_confidence"],
+        "TaskClassReason": task["classification_reason"],
+        "ClassifierModel": task.apply(
+            lambda r: (
+                "doc_prefix_rule"
+                if str(r.get("classification_reason", "")).startswith("Auto: ENG_DOC prefix")
+                else cfg.get("LLM_MODEL", "gpt-4o-mini")
             ),
-            "ClassifierPromptVersion": PROMPT_VERSION,
-            "CreatedBy": CREATED_BY,
-        }
-    )
+            axis=1,
+        ),
+        "ClassifierPromptVersion": PROMPT_VERSION,
+        "CreatedBy": CREATED_BY,
+    }
+    for snake, pascal in PRIMERA_ALL_SCHEDULE_FIELDS:
+        payload[pascal] = task.get(snake)
+    return pd.DataFrame(payload)
 
 
 def save_classified_tasks(conn, db_name, rows):
@@ -724,15 +705,15 @@ def save_classified_tasks(conn, db_name, rows):
             f"""
             INSERT INTO {db_name}.timeline_reconciliation.TimelineTasksClassified (
                 TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
-                TaskDateFieldsJson, TaskText,
+                EarlyStartDate, EarlyEndDate, ActualStartDate, ActualEndDate,
+                TargetStartDate, TargetEndDate, TaskText,
                 TaskClass, TaskClassConfidence, TaskClassReason, ClassifierModel,
                 ClassifierPromptVersion, CreatedBy
             )
             SELECT
                 TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
-                TaskDateFieldsJson, TaskText,
+                EarlyStartDate, EarlyEndDate, ActualStartDate, ActualEndDate,
+                TargetStartDate, TargetEndDate, TaskText,
                 TaskClass, TaskClassConfidence, TaskClassReason, ClassifierModel,
                 ClassifierPromptVersion, CreatedBy
             FROM classified_rows
@@ -890,18 +871,9 @@ def main():
             out_path = OUTPUT_DIR / f"classification_{timeline}.xlsx"
             with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
                 classified[
-                    [
-                        "task_code",
-                        "task_name",
-                        "wbs_name",
-                        "task_start_date",
-                        "task_finish_date",
-                        "task_actual_start_date",
-                        "task_actual_finish_date",
-                        "task_class",
-                        "classification_confidence",
-                        "classification_reason",
-                    ]
+                    ["task_code", "task_name", "wbs_name"]
+                    + [snake for snake, _ in PRIMERA_ALL_SCHEDULE_FIELDS]
+                    + ["task_class", "classification_confidence", "classification_reason"]
                 ].to_excel(writer, sheet_name="Task_LLM_classification", index=False)
             print(f"Creato: {out_path}")
 

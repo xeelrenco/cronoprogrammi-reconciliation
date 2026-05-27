@@ -32,13 +32,13 @@ con `ConsolidatedDecisionType = 'MATCH'`, filtrati sulla stessa timeline tramite
 
 Il flusso e diviso in script:
 
-- `create_timeline_reconciliation_tables.sql`
+- `sql/00_create_timeline_reconciliation.sql` — schema MotherDuck (creazione da zero, con commenti)
   - crea le tabelle `timeline_reconciliation` e i commenti DB
   - non viene eseguito automaticamente dagli script
 - `1_classify_timeline_tasks.py`
   - legge `cronoprogrammi/*.xlsx`
   - classifica task in `ENG_DOC` / `OTHER`
-  - estrae e salva le date Primavera disponibili (`TaskStartDate`, `TaskFinishDate`, actual date e JSON audit)
+  - estrae e salva in DB solo le date core: `Early*`, `Actual*`, `Target*` (input al actualized)
   - scrive `TimelineTasksClassified`
 - `2_prepare_timeline_embeddings.py`
   - genera embeddings dei task `ENG_DOC`
@@ -47,11 +47,10 @@ Il flusso e diviso in script:
   - scrive `TimelineTaskEmbeddings` e `TimelineMdrCandidateEmbeddings`
 - `3_timeline_task_to_mdr_topk.py`
   - calcola cosine similarity task -> MDR candidate
-  - propaga le date task nei candidati Top-K
-  - scrive `TimelineTaskToMdrCandidates`
+  - scrive `TimelineTaskToMdrCandidates` (senza colonne date)
 - `4_resolve_timeline_task_mdr_links.py`
   - usa LLM sui Top-K semantici
-  - propaga le date task nei link finali
+  - copia le date core da Classified e calcola `SelectedStartDate` / `SelectedFinishDate` (actualized: Actual→Early→Target)
   - valida l'output LLM, applica retry, soglia minima e massimo link per task
   - scrive i link finali in `TimelineTaskToMdrLinks` e la diagnostica locale in `output/resolver_diagnostics_<timestamp>.csv`
 
@@ -88,6 +87,7 @@ python .\4_resolve_timeline_task_mdr_links.py --min-link-confidence 0.35
 python .\4_resolve_timeline_task_mdr_links.py --max-links-per-task 3
 python .\4_resolve_timeline_task_mdr_links.py --workers 4
 python .\4_resolve_timeline_task_mdr_links.py --retry-max 2 --retry-backoff-sec 2 --llm-timeout-sec 60
+python .\5_generate_timeline_reconciliation_report.py
 ```
 
 Modalita Batch API per step 4:
@@ -120,7 +120,7 @@ La modalita batch salva gli id in `.timeline_resolver_last_batch_ids.json` e il 
 
 La tabella finale `TimelineTaskToMdrLinks` puo contenere piu righe per lo stesso task quando un task `ENG_DOC` viene associato a piu documenti MDR.
 
-Le date vengono salvate come campi canonici best-effort (`TaskStartDate`, `TaskFinishDate`, `TaskActualStartDate`, `TaskActualFinishDate`) e come `TaskDateFieldsJson`, che preserva tutte le colonne data-like non vuote della riga Primavera originale per audit o future regole di selezione date.
+**Date (v3 minimal):** in DB solo `Early*`, `Actual*`, `Target*` + `Selected*` sui link. Schema SQL: cartella `sql/`. Ricreazione: `DROP SCHEMA … CASCADE` + `sql/00_create_timeline_reconciliation.sql`, poi pipeline `1` → `4`.
 
 ## Modalita Test
 

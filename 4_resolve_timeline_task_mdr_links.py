@@ -13,11 +13,15 @@ import pandas as pd
 from timeline_reconciliation_common import (
     CONFIG_FILE,
     OUTPUT_DIR,
+    build_link_date_snapshot,
     chat_json,
     connect_motherduck,
     parse_config_txt,
+    refresh_timeline_classified_dates_view,
+    refresh_timeline_links_dates_view,
     raci_dedupe_key,
     remove_prefix,
+    serialize_date_value,
 )
 
 
@@ -197,11 +201,12 @@ def load_topk_for_resolver(conn, db_name, embedding_model, timeline_name=None, t
             t.TaskCode,
             k.TaskName,
             k.WbsName,
-            k.TaskStartDate,
-            k.TaskFinishDate,
-            k.TaskActualStartDate,
-            k.TaskActualFinishDate,
-            k.TaskDateFieldsJson,
+            t.EarlyStartDate,
+            t.EarlyEndDate,
+            t.ActualStartDate,
+            t.ActualEndDate,
+            t.TargetStartDate,
+            t.TargetEndDate,
             t.TaskClass,
             t.TaskClassConfidence,
             t.TaskClassReason,
@@ -396,7 +401,7 @@ def _invalid_result(error_type, error_message):
     }
 
 
-def build_resolver_prompts(task_group):
+def build_resolver_prompts(task_group, cfg=None):
     first = task_group.iloc[0]
     candidates = []
     for _, row in task_group.iterrows():
@@ -522,17 +527,15 @@ JSON schema:
   ]
 }
 """
+    selected_dates = build_link_date_snapshot(first)
     user = {
         "task": {
             "task_code": str(first.get("TaskCode", "")),
             "task_name": str(first.get("TaskName", "")),
             "task_name_clean": remove_prefix(first.get("TaskName", "")),
             "wbs_name": str(first.get("WbsName", "")),
-            "task_start_date": str(first.get("TaskStartDate", "")),
-            "task_finish_date": str(first.get("TaskFinishDate", "")),
-            "task_actual_start_date": str(first.get("TaskActualStartDate", "")),
-            "task_actual_finish_date": str(first.get("TaskActualFinishDate", "")),
-            "task_date_fields_json": str(first.get("TaskDateFieldsJson", "")),
+            "selected_start_date": str(serialize_date_value(selected_dates.get("SelectedStartDate")) or ""),
+            "selected_finish_date": str(serialize_date_value(selected_dates.get("SelectedFinishDate")) or ""),
             "task_class_reason": str(first.get("TaskClassReason", "")),
             "task_class_confidence": str(first.get("TaskClassConfidence", "")),
         },
@@ -549,7 +552,7 @@ def resolve_task_links(
     retry_backoff_sec=2.0,
     llm_shortlist_max=DEFAULT_LLM_SHORTLIST_MAX,
 ):
-    system, user = build_resolver_prompts(task_group)
+    system, user = build_resolver_prompts(task_group, cfg=cfg)
     last_error = None
     for attempt in range(max(0, retry_max) + 1):
         try:
@@ -584,10 +587,12 @@ def build_final_rows_for_group(
     min_link_confidence=0.0,
     max_links_per_task=0,
     save_llm_top_max=DEFAULT_LLM_SHORTLIST_MAX,
+    cfg=None,
 ):
     rows = []
     llm_shortlist_rows = []
     first = group.iloc[0]
+    date_snapshot = build_link_date_snapshot(first)
     scope_all = {"TimelineName": timeline_name, "TaskRowId": int(task_row_id)}
     scope_ok = None
     status = resolved.get("status", "invalid_json")
@@ -629,11 +634,7 @@ def build_final_rows_for_group(
                     "TaskCode": cand.get("TaskCode"),
                     "TaskName": cand.get("TaskName"),
                     "WbsName": cand.get("WbsName"),
-                    "TaskStartDate": cand.get("TaskStartDate"),
-                    "TaskFinishDate": cand.get("TaskFinishDate"),
-                    "TaskActualStartDate": cand.get("TaskActualStartDate"),
-                    "TaskActualFinishDate": cand.get("TaskActualFinishDate"),
-                    "TaskDateFieldsJson": cand.get("TaskDateFieldsJson"),
+                    **date_snapshot,
                     "TaskClass": cand.get("TaskClass"),
                     "TaskClassConfidence": cand.get("TaskClassConfidence"),
                     "TaskClassReason": cand.get("TaskClassReason"),
@@ -734,6 +735,7 @@ def process_group_realtime(
         min_link_confidence=min_link_confidence,
         max_links_per_task=max_links_per_task,
         save_llm_top_max=save_llm_top_max,
+        cfg=cfg,
     )
 
 
@@ -846,7 +848,7 @@ def _parse_json_text(text):
 
 def _build_batch_line(custom_id, task_group, cfg):
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
-    system, user = build_resolver_prompts(task_group)
+    system, user = build_resolver_prompts(task_group, cfg=cfg)
     body = {
         "model": model,
         "temperature": 0,
@@ -1010,6 +1012,7 @@ def collect_batch_results(
                     min_link_confidence=min_link_confidence,
                     max_links_per_task=max_links_per_task,
                     save_llm_top_max=llm_shortlist_max,
+                    cfg=cfg,
                 )
             )
 
@@ -1043,6 +1046,7 @@ def collect_batch_results(
                 min_link_confidence=min_link_confidence,
                 max_links_per_task=max_links_per_task,
                 save_llm_top_max=llm_shortlist_max,
+                cfg=cfg,
             )
         )
 
@@ -1065,9 +1069,29 @@ def save_resolver_diagnostics(rows):
     return str(out_path)
 
 
+def ensure_link_schedule_columns(conn, db_name):
+    for col, col_type in (
+        ("EarlyStartDate", "TIMESTAMP"),
+        ("EarlyEndDate", "TIMESTAMP"),
+        ("ActualStartDate", "TIMESTAMP"),
+        ("ActualEndDate", "TIMESTAMP"),
+        ("TargetStartDate", "TIMESTAMP"),
+        ("TargetEndDate", "TIMESTAMP"),
+        ("SelectedStartDate", "TIMESTAMP"),
+        ("SelectedFinishDate", "TIMESTAMP"),
+    ):
+        conn.execute(
+            f"""
+            ALTER TABLE {db_name}.timeline_reconciliation.TimelineTaskToMdrLinks
+            ADD COLUMN IF NOT EXISTS {col} {col_type}
+            """
+        )
+
+
 def save_final_links(conn, db_name, rows, resolved_scope):
     if resolved_scope.empty:
         return 0
+    ensure_link_schedule_columns(conn, db_name)
     conn.register("resolved_scope", resolved_scope)
     try:
         conn.execute("BEGIN;")
@@ -1087,8 +1111,9 @@ def save_final_links(conn, db_name, rows, resolved_scope):
                     f"""
                     INSERT INTO {db_name}.timeline_reconciliation.TimelineTaskToMdrLinks (
                         TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                        TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
-                        TaskDateFieldsJson,
+                        EarlyStartDate, EarlyEndDate, ActualStartDate, ActualEndDate,
+                        TargetStartDate, TargetEndDate,
+                        SelectedStartDate, SelectedFinishDate,
                         TaskClass, TaskClassConfidence, TaskClassReason,
                         MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
                         ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
@@ -1096,8 +1121,9 @@ def save_final_links(conn, db_name, rows, resolved_scope):
                     )
                     SELECT
                         TimelineName, ProjectCode, TaskRowId, TaskCode, TaskName, WbsName,
-                        TaskStartDate, TaskFinishDate, TaskActualStartDate, TaskActualFinishDate,
-                        TaskDateFieldsJson,
+                        EarlyStartDate, EarlyEndDate, ActualStartDate, ActualEndDate,
+                        TargetStartDate, TargetEndDate,
+                        SelectedStartDate, SelectedFinishDate,
                         TaskClass, TaskClassConfidence, TaskClassReason,
                         MdrDocumentTitle, MdrTitleKey, LinkRank, LinkScore, LinkMethod, LinkReason,
                         ConsolidatedDecisionType, ConsolidatedTitleKey, ConsolidatedRaciTitle,
@@ -1109,6 +1135,9 @@ def save_final_links(conn, db_name, rows, resolved_scope):
             finally:
                 conn.unregister("final_links")
         conn.execute("COMMIT;")
+        if inserted:
+            refresh_timeline_classified_dates_view(conn, db_name)
+            refresh_timeline_links_dates_view(conn, db_name)
     except Exception:
         conn.execute("ROLLBACK;")
         raise

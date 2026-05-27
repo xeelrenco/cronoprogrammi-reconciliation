@@ -31,11 +31,26 @@ HEADERS_LINKS = [
     "Resolver LLM — Candidato Top 3",
     "Resolver LLM — Candidato Top 4",
     "Resolver LLM — Candidato Top 5",
-    "TaskStartDate",
-    "TaskFinishDate",
-    "TaskActualStartDate",
-    "TaskActualFinishDate",
 ]
+
+DATE_HEADERS_SELECTED = [
+    "Data inizio (actualized)",
+    "Data fine (actualized)",
+]
+DATE_ROW_KEYS_SELECTED = [
+    "SelectedStartDate",
+    "SelectedFinishDate",
+]
+# Grezze usate nel COALESCE actualized (Actual → Early → Target)
+DATE_HEADERS_RAW = [
+    "EarlyStartDate",
+    "EarlyEndDate",
+    "ActualStartDate",
+    "ActualEndDate",
+    "TargetStartDate",
+    "TargetEndDate",
+]
+HEADERS_LINKS = HEADERS_LINKS + DATE_HEADERS_SELECTED + DATE_HEADERS_RAW
 
 COL_WIDTHS_LINKS = [
     6,
@@ -56,11 +71,8 @@ COL_WIDTHS_LINKS = [
     40,
     40,
     40,
-    18,
-    18,
-    18,
-    18,
 ]
+COL_WIDTHS_LINKS = COL_WIDTHS_LINKS + [22, 22] + [14] * 6
 HEADERS_TASKS = [
     "#",
     "TimelineName",
@@ -71,13 +83,9 @@ HEADERS_TASKS = [
     "TaskClass",
     "TaskClassConfidence",
     "TaskClassReason",
-    "TaskStartDate",
-    "TaskFinishDate",
-    "TaskActualStartDate",
-    "TaskActualFinishDate",
-    "ResolverLinkCount",
 ]
-COL_WIDTHS_TASKS = [6, 30, 10, 16, 54, 36, 12, 14, 52, 18, 18, 18, 18, 12]
+HEADERS_TASKS = HEADERS_TASKS + DATE_HEADERS_SELECTED + DATE_HEADERS_RAW + ["ResolverLinkCount"]
+COL_WIDTHS_TASKS = [6, 30, 10, 16, 54, 36, 12, 14, 52] + [22, 22] + [14] * 6 + [12]
 HEADERS_CLASSIFY = [
     "#",
     "TimelineName",
@@ -102,7 +110,8 @@ SECTION_COLORS = {
     "resolver": ("166534", "ECFDF5"),
     "raci": ("6D28D9", "F5F3FF"),
     "llm_top": ("C2410C", "FFF7ED"),
-    "dates": ("475569", "F8FAFC"),
+    "selected": ("0F766E", "CCFBF1"),
+    "dates": ("64748B", "F1F5F9"),
 }
 
 thin = Side(style="thin", color=GRID)
@@ -262,16 +271,25 @@ def load_links_rows(conn, db_name, embedding_model, timeline_name=None, llm_top_
         c.TaskClass,
         c.TaskClassConfidence,
         c.TaskClassReason,
-        c.TaskStartDate,
-        c.TaskFinishDate,
-        c.TaskActualStartDate,
-        c.TaskActualFinishDate,
-        c.TaskDateFieldsJson,
         COALESCE(lc.ResolverLinkCount, 0) AS ResolverLinkCount,
         l.MdrDocumentTitle AS LinkMdrDocumentTitle,
         l.ConsolidatedRaciTitle AS DocumentRaciTitle,
         l.LinkReason,
-        l.LinkRank
+        l.LinkRank,
+        COALESCE(
+            l.SelectedStartDate,
+            COALESCE(c.ActualStartDate, c.EarlyStartDate, c.TargetStartDate)
+        ) AS SelectedStartDate,
+        COALESCE(
+            l.SelectedFinishDate,
+            COALESCE(c.ActualEndDate, c.EarlyEndDate, c.TargetEndDate)
+        ) AS SelectedFinishDate,
+        COALESCE(l.EarlyStartDate, c.EarlyStartDate) AS EarlyStartDate,
+        COALESCE(l.EarlyEndDate, c.EarlyEndDate) AS EarlyEndDate,
+        COALESCE(l.ActualStartDate, c.ActualStartDate) AS ActualStartDate,
+        COALESCE(l.ActualEndDate, c.ActualEndDate) AS ActualEndDate,
+        COALESCE(l.TargetStartDate, c.TargetStartDate) AS TargetStartDate,
+        COALESCE(l.TargetEndDate, c.TargetEndDate) AS TargetEndDate
     FROM classified_latest c
     LEFT JOIN link_counts lc
       ON lc.TimelineName = c.TimelineName
@@ -299,16 +317,16 @@ def load_links_rows(conn, db_name, embedding_model, timeline_name=None, llm_top_
             "TaskClass": _safe_text(row.get("TaskClass")),
             "TaskClassConfidence": _safe_text(row.get("TaskClassConfidence")),
             "TaskClassReason": _safe_text(row.get("TaskClassReason")),
-            "TaskStartDate": _fmt_ts(row.get("TaskStartDate")),
-            "TaskFinishDate": _fmt_ts(row.get("TaskFinishDate")),
-            "TaskActualStartDate": _fmt_ts(row.get("TaskActualStartDate")),
-            "TaskActualFinishDate": _fmt_ts(row.get("TaskActualFinishDate")),
             "ResolverLinkCount": _safe_int(row.get("ResolverLinkCount"), default=0) or 0,
             "LinkRank": _link_rank_cell(row.get("LinkRank")),
             "LinkReason": _safe_text(row.get("LinkReason")),
             "MdrDocumentTitle": _safe_text(row.get("LinkMdrDocumentTitle")),
             "DocumentRaciTitle": _safe_text(row.get("DocumentRaciTitle")),
         }
+        for header, key in zip(DATE_HEADERS_SELECTED, DATE_ROW_KEYS_SELECTED):
+            out[header] = _fmt_ts(row.get(key))
+        for col in DATE_HEADERS_RAW:
+            out[col] = _fmt_ts(row.get(col))
         if llm_top_lookup is not None:
             key = (out["TimelineName"], out["TaskRowId"])
             slots = llm_top_lookup.get(key, [None] * 5)
@@ -335,13 +353,42 @@ def build_task_summary_rows(link_rows):
                 "TaskClass": r["TaskClass"],
                 "TaskClassConfidence": r["TaskClassConfidence"],
                 "TaskClassReason": r["TaskClassReason"],
-                "TaskStartDate": r["TaskStartDate"],
-                "TaskFinishDate": r["TaskFinishDate"],
-                "TaskActualStartDate": r["TaskActualStartDate"],
-                "TaskActualFinishDate": r["TaskActualFinishDate"],
                 "ResolverLinkCount": r["ResolverLinkCount"],
             }
+            for header in DATE_HEADERS_SELECTED:
+                grouped[key][header] = r.get(header, "")
+            for col in DATE_HEADERS_RAW:
+                grouped[key][col] = r.get(col, "")
     return sorted(grouped.values(), key=lambda x: (x["TimelineName"], x["TaskRowId"]))
+
+
+def _links_selected_col_range():
+    start = HEADERS_LINKS.index(DATE_HEADERS_SELECTED[0]) + 1
+    end = HEADERS_LINKS.index(DATE_HEADERS_SELECTED[-1]) + 1
+    return start, end
+
+
+def _links_raw_col_range():
+    start = HEADERS_LINKS.index(DATE_HEADERS_RAW[0]) + 1
+    end = HEADERS_LINKS.index(DATE_HEADERS_RAW[-1]) + 1
+    return start, end
+
+
+def _links_col_section(col_idx):
+    if col_idx <= 9:
+        return "task"
+    if col_idx <= 13:
+        return "resolver"
+    if col_idx <= 18:
+        return "llm_top"
+    sel_start, sel_end = _links_selected_col_range()
+    if sel_start <= col_idx <= sel_end:
+        return "selected"
+    return "dates"
+
+
+def _is_selected_header(header):
+    return header in DATE_HEADERS_SELECTED
 
 
 def _build_links_sheet(ws, title, rows):
@@ -352,12 +399,14 @@ def _build_links_sheet(ws, title, rows):
     ws["A1"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
     ws.row_dimensions[1].height = 24
 
+    sel_start, sel_end = _links_selected_col_range()
+    raw_start, raw_end = _links_raw_col_range()
     sections = [
         ("Task + Classify", 2, 9, "task"),
-        ("Resolver Final Link", 10, 12, "resolver"),
-        ("MDR to RACI Context", 13, 13, "raci"),
+        ("Resolver Final Link", 10, 13, "resolver"),
         ("Resolver LLM shortlist (max 5)", 14, 18, "llm_top"),
-        ("Task Dates", 19, 22, "dates"),
+        ("Date actualized (Actual → Early → Target)", sel_start, sel_end, "selected"),
+        ("Grezze input actualized", raw_start, raw_end, "dates"),
     ]
     ws.cell(row=2, column=1, value="#")
     ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=1)
@@ -382,22 +431,15 @@ def _build_links_sheet(ws, title, rows):
             ws.column_dimensions[get_column_letter(idx)].width = width
             continue
         c = ws.cell(row=3, column=idx, value=header)
-        if idx <= 9:
-            section_key = "task"
-        elif idx <= 12:
-            section_key = "resolver"
-        elif idx == 13:
-            section_key = "raci"
-        elif idx <= 18:
-            section_key = "llm_top"
-        else:
-            section_key = "dates"
+        section_key = _links_col_section(idx)
         header_color, _ = SECTION_COLORS[section_key]
-        c.font = Font(name="Arial", bold=True, size=9, color=WHITE)
+        header_size = 10 if _is_selected_header(header) else 9
+        c.font = Font(name="Arial", bold=True, size=header_size, color=WHITE)
         c.fill = _fill(header_color)
         c.alignment = _align(center=True)
         c.border = _border()
         ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.row_dimensions[3].height = 32
 
     for i, row in enumerate(rows, 1):
         excel_row = i + 3
@@ -424,29 +466,26 @@ def _build_links_sheet(ws, title, rows):
             row.get("ResolverLlmTop3") or "—",
             row.get("ResolverLlmTop4") or "—",
             row.get("ResolverLlmTop5") or "—",
-            row["TaskStartDate"],
-            row["TaskFinishDate"],
-            row["TaskActualStartDate"],
-            row["TaskActualFinishDate"],
         ]
+        for col in DATE_HEADERS_SELECTED + DATE_HEADERS_RAW:
+            values.append(row.get(col, ""))
+        date_col_start = len(HEADERS_LINKS) - len(DATE_HEADERS_SELECTED) - len(DATE_HEADERS_RAW) + 1
+        sel_start, sel_end = _links_selected_col_range()
         for col_idx, value in enumerate(values, 1):
             c = ws.cell(row=excel_row, column=col_idx, value=_safe_text(value))
             c.border = _border()
-            c.alignment = _align(center=col_idx in (1, 3, 7, 8, 10, 13, 19))
+            c.alignment = _align(
+                center=col_idx in (1, 3, 7, 8, 10) or col_idx >= date_col_start
+            )
             if col_idx in (7, 8):
                 c.fill = _fill(class_bg)
                 c.font = Font(name="Arial", bold=True, size=9, color=fg)
+            elif sel_start <= col_idx <= sel_end:
+                _, cell_color = SECTION_COLORS["selected"]
+                c.fill = _fill(cell_color)
+                c.font = Font(name="Arial", bold=True, size=11, color="064E3B")
             else:
-                if col_idx <= 9:
-                    _, cell_color = SECTION_COLORS["task"]
-                elif col_idx <= 12:
-                    _, cell_color = SECTION_COLORS["resolver"]
-                elif col_idx == 13:
-                    _, cell_color = SECTION_COLORS["raci"]
-                elif col_idx <= 18:
-                    _, cell_color = SECTION_COLORS["llm_top"]
-                else:
-                    _, cell_color = SECTION_COLORS["dates"]
+                _, cell_color = SECTION_COLORS[_links_col_section(col_idx)]
                 c.fill = _fill(cell_color)
                 if 14 <= col_idx <= 18:
                     c.font = Font(name="Arial", size=9, color="7C2D12")
@@ -467,10 +506,18 @@ def _build_tasks_sheet(ws, title, rows):
     ws["A1"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
     ws.row_dimensions[1].height = 24
 
+    sel_start = HEADERS_TASKS.index(DATE_HEADERS_SELECTED[0]) + 1
+    sel_end = HEADERS_TASKS.index(DATE_HEADERS_SELECTED[-1]) + 1
+    sel_header_color, _ = SECTION_COLORS["selected"]
+
     for idx, (header, width) in enumerate(zip(HEADERS_TASKS, COL_WIDTHS_TASKS), 1):
         c = ws.cell(row=2, column=idx, value=header)
-        c.font = Font(name="Arial", bold=True, size=9, color=WHITE)
-        c.fill = _fill("1A2E42")
+        if sel_start <= idx <= sel_end:
+            c.fill = _fill(sel_header_color)
+            c.font = Font(name="Arial", bold=True, size=10, color=WHITE)
+        else:
+            c.fill = _fill("1A2E42")
+            c.font = Font(name="Arial", bold=True, size=9, color=WHITE)
         c.alignment = _align(center=True)
         c.border = _border()
         ws.column_dimensions[get_column_letter(idx)].width = width
@@ -481,13 +528,20 @@ def _build_tasks_sheet(ws, title, rows):
         bg = CLASS_BG.get(task_class, "F8FAFC")
         fg = CLASS_FG.get(task_class, "1A1A2E")
         values = [i] + [row[h] for h in HEADERS_TASKS[1:]]
+        date_start = HEADERS_TASKS.index(DATE_HEADERS_SELECTED[0]) + 1
+        _, sel_cell_color = SECTION_COLORS["selected"]
         for col_idx, value in enumerate(values, 1):
             c = ws.cell(row=excel_row, column=col_idx, value=_safe_text(value))
             c.border = _border()
-            c.alignment = _align(center=col_idx in (1, 3, 7, 8, 14))
+            c.alignment = _align(
+                center=col_idx in (1, 3, 7, 8, len(HEADERS_TASKS)) or col_idx >= date_start
+            )
             if col_idx in (7, 8):
                 c.fill = _fill(bg)
                 c.font = Font(name="Arial", bold=True, size=9, color=fg)
+            elif sel_start <= col_idx <= sel_end:
+                c.fill = _fill(sel_cell_color)
+                c.font = Font(name="Arial", bold=True, size=11, color="064E3B")
             else:
                 c.fill = _fill("FFFFFF")
                 c.font = Font(name="Arial", size=9, color="1A1A2E")
