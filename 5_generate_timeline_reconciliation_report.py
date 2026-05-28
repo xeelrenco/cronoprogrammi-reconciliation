@@ -1,5 +1,6 @@
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -7,10 +8,15 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from timeline_reconciliation_common import connect_motherduck, parse_config_txt
+from timeline_reconciliation_common import OUTPUT_DIR, connect_motherduck, parse_config_txt
 
 
-DEFAULT_OUTPUT = "timeline_reconciliation_report.xlsx"
+DEFAULT_OUTPUT_BASENAME = "timeline_reconciliation_report"
+
+
+def default_report_output_path() -> Path:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return OUTPUT_DIR / f"{DEFAULT_OUTPUT_BASENAME}_{ts}.xlsx"
 
 HEADERS_LINKS = [
     "#",
@@ -599,6 +605,23 @@ def _build_classify_sheet(ws, title, rows):
     ws.freeze_panes = "A3"
 
 
+def _save_workbook(wb, output_path: Path) -> Path:
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        wb.save(output_path)
+        return output_path
+    except PermissionError:
+        fallback = default_report_output_path()
+        wb.save(fallback)
+        print(
+            f"ATTENZIONE: impossibile scrivere {output_path} (file aperto o permessi insufficienti).\n"
+            f"Report salvato in: {fallback}",
+            file=sys.stderr,
+        )
+        return fallback
+
+
 def write_report(link_rows, output_path):
     task_rows = build_task_summary_rows(link_rows)
     wb = Workbook()
@@ -609,13 +632,17 @@ def write_report(link_rows, output_path):
     eng_link_rows = [r for r in link_rows if r.get("TaskClass") == "ENG_DOC"]
     _build_links_sheet(wb.create_sheet("ENG_DOC Full"), "ENG_DOC Full", eng_link_rows)
 
-    wb.save(output_path)
+    return _save_workbook(wb, output_path)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate timeline reconciliation Excel report (classify + resolver).")
     parser.add_argument("--timeline", default="", help="Optional TimelineName filter.")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output xlsx path.")
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Output xlsx path (default: output/timeline_reconciliation_report_YYYYMMDD_HHMMSS.xlsx).",
+    )
     parser.add_argument(
         "--embedding-model",
         default="",
@@ -627,7 +654,7 @@ def main():
     db_name = cfg.get("MOTHERDUCK_DB", "my_db").strip() or "my_db"
     embedding_model = (args.embedding_model.strip() or cfg.get("EMBEDDING_MODEL") or "text-embedding-3-small").strip()
     timeline_name = args.timeline.strip() or None
-    output_path = Path(args.output).resolve()
+    output_path = Path(args.output).resolve() if args.output.strip() else default_report_output_path()
 
     llm_lookup = {}
     try:
@@ -658,8 +685,8 @@ def main():
     finally:
         conn.close()
 
-    write_report(rows, output_path)
-    print(f"[OK] Report generated: {output_path}")
+    saved_path = write_report(rows, output_path)
+    print(f"[OK] Report generated: {saved_path}")
     task_rows = build_task_summary_rows(rows)
     print(f"Total link-view rows: {len(rows)}")
     print(f"Total tasks: {len(task_rows)}")

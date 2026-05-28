@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from timeline_reconciliation_common import (
     build_link_date_snapshot,
     chat_json,
     connect_motherduck,
+    normalize,
     parse_config_txt,
     refresh_timeline_classified_dates_view,
     refresh_timeline_links_dates_view,
@@ -27,8 +29,37 @@ from timeline_reconciliation_common import (
 
 CREATED_BY = "4_resolve_timeline_task_mdr_links.py"
 LINK_METHOD = "embedding_topk_llm_resolver"
+LINK_METHOD_EXACT = "exact_mdr_title_match"
 DEFAULT_LLM_SHORTLIST_MAX = 5
 LLM_SHORTLIST_HARD_MAX = 5
+DOC_STATUS_PREFIX_RE = re.compile(
+    r"^(IFI\+?|IFC|IDC|IFR|IFA|IFD|ASB|IFF|IFT|IFO|AB|APP|INT)\s*[-–—]\s*",
+    re.I,
+)
+GENERIC_SUBJECT_TOKENS = frozenset(
+    {
+        "specification", "specifications", "sheet", "data", "ids", "rdds", "mto", "drawing",
+        "drawings", "layout", "report", "diagram", "system", "engineering", "document",
+        "documents", "revision", "approval", "period", "issue", "purchase", "including",
+        "material", "materials", "technical", "design", "plan", "details", "detail",
+        "general", "typical", "vendor", "package", "progress", "update", "delivery",
+        "and", "for", "the", "with", "from", "area", "period", "cancel", "deleted",
+    }
+)
+BUNDLE_DOC_TYPE_KEYWORDS = (
+    "specification",
+    "data sheet",
+    "ids",
+    "rdds",
+    "mto",
+    "drawing",
+    "layout",
+    "report",
+    "diagram",
+    "schedule",
+    "follow up",
+    "follow-up",
+)
 BATCH_IDS_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_ids.json"
 BATCH_MANIFEST_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_manifest.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
@@ -46,6 +77,152 @@ def safe_float(value, default=0.0):
 
 def clamp01(value):
     return max(0.0, min(1.0, safe_float(value)))
+
+
+def _task_subject_for_match(task_name: str) -> str:
+    s = str(task_name or "").strip()
+    s = DOC_STATUS_PREFIX_RE.sub("", s).strip()
+    s = remove_prefix(s).strip()
+    s = re.sub(r"\s*[-–—]\s*Revision and Approval Period\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*[-–—]\s*\d+(?:st|nd|rd|th)?\s+Issue\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*[-–—]\s*Cancel\s*$", "", s, flags=re.I)
+    s = re.sub(r"/\d+\+?\s*$", "", s).strip()
+    return normalize(s)
+
+
+def _significant_tokens(text: str):
+    return [t for t in normalize(text).split() if t not in GENERIC_SUBJECT_TOKENS and len(t) > 2]
+
+
+def _subject_overlap(task_name: str, mdr_title: str, min_shared: int = 2) -> bool:
+    task_tokens = set(_significant_tokens(_task_subject_for_match(task_name)))
+    mdr_tokens = set(_significant_tokens(mdr_title))
+    if not task_tokens or not mdr_tokens:
+        return False
+    shared = task_tokens & mdr_tokens
+    if len(shared) >= min_shared:
+        return True
+    return len(shared) >= 1 and len(shared) / max(len(task_tokens), 1) >= 0.5
+
+
+def _mdr_title_match_score(task_name: str, mdr_title: str) -> float:
+    a = _task_subject_for_match(task_name)
+    b = normalize(mdr_title)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) >= 12 and (a in b or b in a):
+        return 0.97
+    a_tokens = set(_significant_tokens(a))
+    b_tokens = set(_significant_tokens(b))
+    if not a_tokens or not b_tokens:
+        return 0.0
+    overlap = a_tokens & b_tokens
+    if len(overlap) >= 3:
+        return 0.92
+    if len(overlap) >= 2 and len(overlap) / max(len(a_tokens), 1) >= 0.5:
+        return 0.88
+    return 0.0
+
+
+def task_lists_document_bundle(task_name: str) -> bool:
+    clean = remove_prefix(str(task_name or "")).lower()
+    if " / " not in clean:
+        return False
+    parts = [p.strip() for p in clean.split(" / ")]
+    hits = sum(1 for part in parts if any(kw in part for kw in BUNDLE_DOC_TYPE_KEYWORDS))
+    return hits >= 2
+
+
+def _find_best_exact_match_candidate(task_group, task_name: str):
+    best_id = None
+    best_score = 0.0
+    for _, row in task_group.iterrows():
+        score = _mdr_title_match_score(task_name, row.get("MdrDocumentTitle", ""))
+        if score > best_score:
+            best_score = score
+            best_id = int(row["RetrievalRank"])
+    if best_id is None or best_score < 0.88:
+        return None, best_score
+    return best_id, best_score
+
+
+def _filter_links_by_subject(links, task_group, task_name: str):
+    if not links:
+        return links
+    rank_by_id = _rank_by_retrieval_id(task_group)
+    kept = []
+    for idx, link in enumerate(links):
+        cid = int(link["candidate_id"])
+        row = rank_by_id.get(cid)
+        mdr = str(row.get("MdrDocumentTitle", "")) if row is not None else ""
+        if idx == 0 or _subject_overlap(task_name, mdr):
+            kept.append(link)
+    return kept
+
+
+def refine_resolver_links(resolved, task_group):
+    if resolved.get("status") != "ok":
+        return resolved
+    first = task_group.iloc[0]
+    task_name = str(first.get("TaskName", ""))
+    is_bundle = task_lists_document_bundle(task_name)
+    exact_id, exact_score = _find_best_exact_match_candidate(task_group, task_name)
+    links = list(resolved.get("links") or [])
+    rank_by_id = _rank_by_retrieval_id(task_group)
+
+    if exact_id is not None and not is_bundle:
+        exact_link = None
+        for link in links:
+            if int(link["candidate_id"]) == exact_id:
+                exact_link = dict(link)
+                break
+        if exact_link is None:
+            exact_link = {
+                "candidate_id": exact_id,
+                "confidence": max(0.97, exact_score),
+                "reason_short": "Auto: exact MDR title match",
+                "link_method": LINK_METHOD_EXACT,
+            }
+        else:
+            exact_link = dict(exact_link)
+            exact_link["confidence"] = max(safe_float(exact_link.get("confidence")), 0.97, exact_score)
+            exact_link["link_method"] = LINK_METHOD_EXACT
+            if not str(exact_link.get("reason_short", "")).strip():
+                exact_link["reason_short"] = "Auto: exact MDR title match"
+        links = [exact_link]
+    elif exact_id is not None and is_bundle:
+        has_exact = any(int(x["candidate_id"]) == exact_id for x in links)
+        if not has_exact:
+            links.insert(
+                0,
+                {
+                    "candidate_id": exact_id,
+                    "confidence": max(0.97, exact_score),
+                    "reason_short": "Auto: exact MDR title match",
+                    "link_method": LINK_METHOD_EXACT,
+                },
+            )
+        links = _filter_links_by_subject(links, task_group, task_name)
+    else:
+        links = _filter_links_by_subject(links, task_group, task_name)
+
+    deduped = []
+    seen_keys = set()
+    for link in links:
+        cid = int(link["candidate_id"])
+        row = rank_by_id.get(cid)
+        dkey = _raci_key_from_row(row) if row is not None else f"cid:{cid}"
+        if dkey in seen_keys:
+            continue
+        seen_keys.add(dkey)
+        deduped.append(link)
+
+    out = dict(resolved)
+    out["links"] = deduped
+    out["valid_links_count"] = len(deduped)
+    return out
 
 
 def _raci_key_from_row(row) -> str:
@@ -477,7 +654,26 @@ when comparing task_name_clean to MDR candidate titles:
 When a task name explicitly lists multiple document types separated by "/" or "and"
 (e.g. "Specification / Data Sheet / IDS"), treat each type independently.
 Link each candidate that matches one of the listed document types — do not require
-a single candidate to cover all types.
+a single candidate to cover all types. Each linked candidate must still share the same
+specific subject/equipment as the task (e.g. MV Cables, not switchgear).
+
+Rank 1 priority rule:
+If one candidate's mdr_document_title is an exact or near-exact match to task_name_clean
+(same subject and document scope), that candidate MUST be link rank 1 with highest confidence.
+Prefer the specific MDR document title over a generic RACI category title.
+
+Secondary links (rank 2+):
+Add extra links ONLY when the task is a document bundle (multiple types in the name)
+OR when the additional candidate shares the same specific subject tokens as the task.
+Do NOT add secondary links that match only a generic document type (IDS, specification, layout)
+on a different subject (e.g. task "Bolts and Nuts" must not link IDS for "Fittings").
+
+Multiple links are allowed when the task clearly covers a bundle/group of documents,
+not merely because several candidates are semantically nearby in the same discipline.
+
+If task_class_confidence is LOW, be extra conservative and prefer no links.
+If uncertain, return:
+{"links": [], "top_candidates": []}
 
 Industry acronym equivalence: treat the following as strong title matches
 when they appear in both the task and the candidate:
@@ -488,13 +684,6 @@ when they appear in both the task and the candidate:
 - P&ID / PID
 More generally: if two titles differ only by an industry-standard prefix or
 abbreviation variant referring to the same equipment type, consider them equivalent.
-
-Multiple links are allowed only when the task clearly covers a bundle/group of documents,
-not merely because several candidates are similar.
-
-If task_class_confidence is LOW, be extra conservative and prefer no links.
-If uncertain, return:
-{"links": [], "top_candidates": []}
 
 Also return top_candidates: an ordered shortlist of up to 5 distinct candidates (best first)
 that are the most semantically plausible matches from the provided list — even when links is empty.
@@ -604,6 +793,8 @@ def build_final_rows_for_group(
     saved_link_count = 0
 
     if status == "ok":
+        resolved = refine_resolver_links(resolved, group)
+        status = resolved.get("status", status)
         scope_ok = {"TimelineName": timeline_name, "TaskRowId": int(task_row_id)}
         selected = resolved.get("links", [])
         before_threshold = len(selected)
@@ -616,6 +807,7 @@ def build_final_rows_for_group(
         selected = sorted(
             selected,
             key=lambda x: (
+                0 if str(x.get("link_method") or "") == LINK_METHOD_EXACT else 1,
                 -safe_float(x.get("confidence", 0.0)),
                 -similarity_by_id.get(int(x["candidate_id"]), 0.0),
                 int(x["candidate_id"]),
@@ -642,7 +834,7 @@ def build_final_rows_for_group(
                     "MdrTitleKey": cand.get("MdrTitleKey"),
                     "LinkRank": link_rank,
                     "LinkScore": link["confidence"],
-                    "LinkMethod": LINK_METHOD,
+                    "LinkMethod": link.get("link_method") or LINK_METHOD,
                     "LinkReason": link["reason_short"],
                     "ConsolidatedDecisionType": cand.get("ConsolidatedDecisionType"),
                     "ConsolidatedTitleKey": cand.get("ConsolidatedTitleKey"),

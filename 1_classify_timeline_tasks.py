@@ -176,14 +176,23 @@ manufacturing, delivery, and generic project activities.
 
 Important:
 - If the activity refers to procurement/material purchasing phases, classify OTHER.
-- Tasks whose name starts with RFC, TBE, TE, BCO, or EPA are usually NOT ENG_DOC
-  (transmittal, bid/technical evaluation, baseline, EPA sessions — not MDR document issue).
+- Tasks whose name contains TBE, "Technical Evaluation", "Technical Bid Evaluation",
+  or "Tech. Eval" (anywhere in the name, not only as prefix) classify as ENG_DOC:
+  they refer to TBE deliverables that exist in the RACI matrix.
+- Exception: if the task is clearly procurement-only (RFQ, PO, BID, vendor meeting,
+  order placement), classify OTHER even when TBE or evaluation wording appears.
+- Tasks whose name starts with RFC, BCO, or EPA are usually NOT ENG_DOC
+  (transmittal, baseline, EPA sessions — not MDR document issue).
 - Tasks containing "MTO" (Material Take-Off) classify as ENG_DOC, unless the task
   is clearly a procurement step (RFQ, PO, BID, order).
 - Use wbs_name only as supporting context, not as the only reason.
 - If uncertain, use OTHER with LOW or MEDIUM confidence.
 - Tasks whose name starts with IFC, IFD, IFI, IFR, IFO, IFA, IFT, IFF, IDC, ASB,
   AB, APP, or INT are classified by rules before this call; you only see the rest.
+
+Examples:
+- "Pressure Safety Valves - Technical Evaluation" → ENG_DOC
+- "RfQ for AIR COMPRESSOR PACKAGE" → OTHER
 
 JSON schema:
 {
