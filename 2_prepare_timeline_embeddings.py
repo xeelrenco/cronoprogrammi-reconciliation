@@ -26,12 +26,25 @@ def load_eng_doc_tasks(conn, db_name, timeline_name=None):
         params.append(timeline_name)
     return conn.execute(
         f"""
-        SELECT DISTINCT
+        WITH c_latest AS (
+            SELECT *
+            FROM (
+                SELECT
+                    c.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.TimelineName, c.TaskRowId
+                        ORDER BY c.UpdatedAt DESC, c.CreatedAt DESC
+                    ) AS rn
+                FROM {db_name}.timeline_reconciliation.TimelineTasksClassified c
+            ) x
+            WHERE x.rn = 1
+        )
+        SELECT
             TimelineName,
             ProjectCode,
             TaskRowId,
             TaskText
-        FROM {db_name}.timeline_reconciliation.TimelineTasksClassified
+        FROM c_latest
         {where}
         ORDER BY TimelineName, TaskRowId
         """,
@@ -119,15 +132,35 @@ def get_existing_candidate_hashes(conn, db_name, embedding_model, timeline_name=
     return {(r[0], r[1], r[2]): r[3] for r in rows}
 
 
+def _normalize_hash_key_part(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    return text if text else None
+
+
+def _hash_lookup_key(key_cols, row):
+    return tuple(_normalize_hash_key_part(row[c]) for c in key_cols)
+
+
 def filter_rows_to_refresh(rows, key_cols, text_col, existing_hashes, force_refresh):
     out = rows.copy()
     out["TextHash"] = out[text_col].apply(text_hash)
     if force_refresh:
         return out
+    normalized_existing = {
+        tuple(_normalize_hash_key_part(k[i]) for i in range(len(k))): h
+        for k, h in existing_hashes.items()
+    }
     keep_mask = []
     for _, row in out.iterrows():
-        key = tuple(row[c] for c in key_cols)
-        keep_mask.append(existing_hashes.get(key) != row["TextHash"])
+        key = _hash_lookup_key(key_cols, row)
+        keep_mask.append(normalized_existing.get(key) != row["TextHash"])
     return out[pd.Series(keep_mask, index=out.index)].copy()
 
 

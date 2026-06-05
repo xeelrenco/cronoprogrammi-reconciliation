@@ -16,6 +16,7 @@ from timeline_reconciliation_common import (
     CRONOPROGRAMMI_DIR,
     OUTPUT_DIR,
     PRIMERA_ALL_SCHEDULE_FIELDS,
+    build_chat_completion_body,
     build_task_text,
     chat_json,
     classified_row_dates_for_ref,
@@ -292,15 +293,14 @@ def _parse_classification_result(parsed: Dict[str, Any]) -> Dict[str, str]:
 def _build_batch_line(task_ref: Dict[str, Any], cfg: Dict[str, str]) -> str:
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
     system, user = build_classifier_prompts(task_ref.get("task_name", ""), task_ref.get("wbs_name", ""))
-    body = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
+    body = build_chat_completion_body(
+        model,
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
-        "response_format": {"type": "json_object"},
-    }
+        response_format={"type": "json_object"},
+    )
     return json.dumps(
         {
             "custom_id": task_ref["custom_id"],

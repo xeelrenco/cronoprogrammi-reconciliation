@@ -1,6 +1,8 @@
 import hashlib
 import json
 import re
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -66,6 +68,231 @@ def remove_prefix(text):
     if len(parts) == 2 and len(parts[0]) <= 4:
         return parts[1].strip()
     return text
+
+
+DOC_STATUS_PREFIX_RE = re.compile(
+    r"^(IFI\+?|IFC|IDC|IFR|IFA|IFD|ASB|IFF|IFT|IFO|AB|APP|INT)\s*[-–—]\s*",
+    re.I,
+)
+GENERIC_SUBJECT_TOKENS = frozenset(
+    {
+        "specification", "specifications", "sheet", "data", "ids", "rdds", "mto", "drawing",
+        "drawings", "layout", "report", "diagram", "system", "engineering", "document",
+        "documents", "revision", "approval", "period", "issue", "purchase", "including",
+        "material", "materials", "technical", "design", "plan", "details", "detail",
+        "general", "typical", "vendor", "package", "progress", "update", "delivery",
+        "and", "for", "the", "with", "from", "area", "period", "cancel", "deleted",
+    }
+)
+TITLE_MATCH_MIN_SCORE = 0.88
+TITLE_MATCH_STRONG_SCORE = 0.97
+SUBJECT_TOKEN_ALIASES = {
+    "bld": "building",
+    "arch": "architectural",
+    "architecturals": "architectural",
+    "dwgs": "drawings",
+}
+BUILDING_CONTEXT_TOKENS = frozenset(
+    {
+        "security", "house", "building", "main", "architectural", "arch",
+        "architecturals", "dwgs", "drawings", "doors", "windows", "schedule",
+        "abacus", "buildings", "cancel",
+    }
+)
+DRAINAGE_SUBTYPE_TOKENS = {
+    "groundwater": frozenset({"groundwater"}),
+    "rain": frozenset({"rain", "storm", "rainwater", "stormwater"}),
+    "sewer": frozenset({"sewer", "sewerage", "sanitary"}),
+}
+INCOMPATIBLE_DRAINAGE_SUBTYPES = frozenset(
+    {
+        ("groundwater", "rain"),
+        ("groundwater", "sewer"),
+        ("rain", "groundwater"),
+        ("sewer", "groundwater"),
+    }
+)
+EQUIPMENT_ANCHOR_RULES = (
+    frozenset({"cccw", "circulating"}),
+    frozenset({"soft", "start"}),
+)
+EQUIPMENT_ANCHOR_MATCH_SCORE = 0.93
+
+
+def task_subject_for_match(task_name: str) -> str:
+    s = str(task_name or "").strip()
+    s = DOC_STATUS_PREFIX_RE.sub("", s).strip()
+    s = remove_prefix(s).strip()
+    s = re.sub(r"\s*[-–—]\s*Revision and Approval Period\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*[-–—]\s*\d+(?:st|nd|rd|th)?\s+Issue\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*[-–—]\s*Cancel\s*$", "", s, flags=re.I)
+    s = re.sub(r"/\d+\+?\s*$", "", s).strip()
+    return normalize(s)
+
+
+def significant_tokens(text: str):
+    return [t for t in normalize(text).split() if t not in GENERIC_SUBJECT_TOKENS and len(t) > 2]
+
+
+def normalized_match_tokens(text: str):
+    expanded = set(significant_tokens(text))
+    for token in list(expanded):
+        alias = SUBJECT_TOKEN_ALIASES.get(token)
+        if alias:
+            expanded.add(alias)
+    return expanded
+
+
+def _drainage_subtype_keys(tokens) -> set:
+    keys = set()
+    for key, markers in DRAINAGE_SUBTYPE_TOKENS.items():
+        if tokens & markers:
+            keys.add(key)
+    return keys
+
+
+def drainage_subtype_conflict(task_name: str, mdr_title: str) -> bool:
+    """Block links across incompatible hydraulic subtypes (e.g. groundwater vs rain)."""
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    task_keys = _drainage_subtype_keys(task_tokens)
+    mdr_keys = _drainage_subtype_keys(mdr_tokens)
+    if not task_keys or not mdr_keys or task_keys & mdr_keys:
+        return False
+    for task_key in task_keys:
+        for mdr_key in mdr_keys:
+            if (task_key, mdr_key) in INCOMPATIBLE_DRAINAGE_SUBTYPES:
+                return True
+    return False
+
+
+def shares_equipment_anchor(task_name: str, mdr_title: str) -> bool:
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    return any(rule <= task_tokens and rule <= mdr_tokens for rule in EQUIPMENT_ANCHOR_RULES)
+
+
+def link_subject_gates_block(task_name: str, mdr_title: str) -> bool:
+    if drainage_subtype_conflict(task_name, mdr_title):
+        return True
+    return title_has_hard_subject_conflict(task_name, mdr_title)
+
+
+def _candidate_match_titles(row, mdr_title_col="MdrDocumentTitle"):
+    titles = []
+    mdr = str(row.get(mdr_title_col, "") or "").strip()
+    if mdr:
+        titles.append(mdr)
+    raci = str(row.get("ConsolidatedRaciTitle", "") or "").strip()
+    if raci and raci not in titles:
+        titles.append(raci)
+    return titles
+
+
+def candidate_title_match_score(task_name: str, row, mdr_title_col="MdrDocumentTitle") -> float:
+    scores = [mdr_title_match_score(task_name, title) for title in _candidate_match_titles(row, mdr_title_col)]
+    return max(scores) if scores else 0.0
+
+
+def _is_building_alias_case(task_tokens, mdr_tokens) -> bool:
+    if not (task_tokens & BUILDING_CONTEXT_TOKENS):
+        return False
+    if not (mdr_tokens & BUILDING_CONTEXT_TOKENS):
+        return False
+    return True
+
+
+def title_has_hard_subject_conflict(task_name: str, mdr_title: str, score=None) -> bool:
+    """True only for near-duplicate titles with swapped equipment/subject (e.g. Compressor vs Gearbox)."""
+    if shares_equipment_anchor(task_name, mdr_title):
+        return False
+    if score is None:
+        score = mdr_title_match_score(task_name, mdr_title)
+    if score >= TITLE_MATCH_STRONG_SCORE:
+        return False
+    if score < TITLE_MATCH_MIN_SCORE:
+        return False
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    if _is_building_alias_case(task_tokens, mdr_tokens):
+        return False
+    unmatched_task = task_tokens - mdr_tokens
+    unmatched_mdr = mdr_tokens - task_tokens
+    if not unmatched_task or not unmatched_mdr:
+        return False
+    overlap = task_tokens & mdr_tokens
+    return len(overlap) >= 3
+
+
+def mdr_title_match_score(task_name: str, mdr_title: str) -> float:
+    a = task_subject_for_match(task_name)
+    b = normalize(mdr_title)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if len(a) >= 12 and (a in b or b in a):
+        return 0.97
+    a_tokens = normalized_match_tokens(a)
+    b_tokens = normalized_match_tokens(b)
+    if not a_tokens or not b_tokens:
+        return 0.0
+    overlap = a_tokens & b_tokens
+    token_score = 0.0
+    if len(overlap) >= 3:
+        token_score = 0.92
+    elif len(overlap) >= 2 and len(overlap) / max(len(a_tokens), 1) >= 0.5:
+        token_score = 0.88
+    anchor_score = EQUIPMENT_ANCHOR_MATCH_SCORE if shares_equipment_anchor(task_name, mdr_title) else 0.0
+    return max(token_score, anchor_score)
+
+
+def title_match_qualifies(task_name: str, mdr_title: str, score: float) -> bool:
+    if drainage_subtype_conflict(task_name, mdr_title):
+        return False
+    if score >= TITLE_MATCH_STRONG_SCORE:
+        return True
+    if score < TITLE_MATCH_MIN_SCORE:
+        return False
+    return not title_has_hard_subject_conflict(task_name, mdr_title, score)
+
+
+def _title_match_rank_key(task_name: str, mdr_title: str, score: float):
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    subject_overlap = len(task_tokens & mdr_tokens)
+    return (score, subject_overlap, -len(mdr_tokens - task_tokens))
+
+
+def find_best_title_match(candidates, task_name: str, id_col=None, mdr_title_col="MdrDocumentTitle"):
+    best_id = None
+    best_score = 0.0
+    best_rank_key = None
+    best_title = ""
+    for idx, row in candidates.iterrows():
+        row_titles = _candidate_match_titles(row, mdr_title_col)
+        row_score = 0.0
+        row_title = ""
+        row_rank_key = None
+        for title in row_titles:
+            score = mdr_title_match_score(task_name, title)
+            if not title_match_qualifies(task_name, title, score):
+                continue
+            rank_key = _title_match_rank_key(task_name, title, score)
+            if row_rank_key is None or rank_key > row_rank_key:
+                row_rank_key = rank_key
+                row_score = score
+                row_title = title
+        if row_rank_key is None:
+            continue
+        if best_rank_key is None or row_rank_key > best_rank_key:
+            best_rank_key = row_rank_key
+            best_score = row_score
+            best_id = int(row[id_col]) if id_col else int(idx)
+            best_title = row_title
+    if best_id is None or best_score < TITLE_MATCH_MIN_SCORE:
+        return None, 0.0
+    return best_id, best_score
 
 
 def extract_project_code(timeline_name):
@@ -353,20 +580,44 @@ def connect_motherduck(cfg):
     return duckdb.connect(f"md:{db_name}?motherduck_token={token}")
 
 
+def llm_supports_custom_temperature(model: str) -> bool:
+    """Some OpenAI models only accept the default temperature (1)."""
+    m = (model or "").strip().lower()
+    if not m:
+        return True
+    if m.startswith(("o1", "o3", "o4")):
+        return False
+    if "gpt-5" in m:
+        return False
+    return True
+
+
+def llm_temperature_kwargs(model: str, temperature=0):
+    if llm_supports_custom_temperature(model):
+        return {"temperature": temperature}
+    return {}
+
+
+def build_chat_completion_body(model: str, messages, **extra):
+    body = {"model": model, "messages": messages}
+    body.update(llm_temperature_kwargs(model))
+    body.update(extra)
+    return body
+
+
 def chat_json(cfg, system, user, timeout=60):
     api_key = cfg.get("LLM_API_KEY", "")
     if not api_key:
         raise ValueError("LLM_API_KEY mancante in config.txt")
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
     base_url = cfg.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    body = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
+    body = build_chat_completion_body(
+        model,
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
-    }
+    )
     req = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -406,7 +657,7 @@ def embed_text(cfg, text, timeout=60):
     return arr
 
 
-def embed_texts(cfg, texts, batch_size=256, timeout=60):
+def embed_texts(cfg, texts, batch_size=256, timeout=180, retry_max=3, retry_backoff=2.0):
     api_key = cfg.get("LLM_API_KEY", "")
     if not api_key:
         raise ValueError("LLM_API_KEY mancante in config.txt")
@@ -422,8 +673,25 @@ def embed_texts(cfg, texts, batch_size=256, timeout=60):
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        last_err = None
+        for attempt in range(retry_max + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                last_err = None
+                break
+            except (TimeoutError, urllib.error.URLError) as exc:
+                last_err = exc
+                if attempt >= retry_max:
+                    raise
+                wait_s = retry_backoff * (attempt + 1)
+                print(
+                    f"[embeddings] batch {i // batch_size + 1} timeout/rete "
+                    f"(tentativo {attempt + 1}/{retry_max + 1}), attendo {wait_s:.0f}s..."
+                )
+                time.sleep(wait_s)
+        if last_err is not None:
+            raise last_err
         data = json.loads(raw)["data"]
         for item in data:
             arr = np.asarray(item["embedding"], dtype=np.float32)

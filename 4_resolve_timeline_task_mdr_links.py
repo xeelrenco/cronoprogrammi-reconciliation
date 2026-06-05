@@ -1,6 +1,5 @@
 import argparse
 import json
-import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -14,9 +13,12 @@ import pandas as pd
 from timeline_reconciliation_common import (
     CONFIG_FILE,
     OUTPUT_DIR,
+    build_chat_completion_body,
     build_link_date_snapshot,
     chat_json,
     connect_motherduck,
+    find_best_title_match,
+    mdr_title_match_score,
     normalize,
     parse_config_txt,
     refresh_timeline_classified_dates_view,
@@ -24,28 +26,21 @@ from timeline_reconciliation_common import (
     raci_dedupe_key,
     remove_prefix,
     serialize_date_value,
+    task_subject_for_match,
+    link_subject_gates_block,
+    significant_tokens,
 )
 
 
 CREATED_BY = "4_resolve_timeline_task_mdr_links.py"
 LINK_METHOD = "embedding_topk_llm_resolver"
 LINK_METHOD_EXACT = "exact_mdr_title_match"
+LINK_METHOD_FALLBACK = "llm_resolver_rank1_fallback"
+LINK_METHOD_TOP_CANDIDATE_FALLBACK = "llm_top_candidate_fallback"
+MIN_TOP_CANDIDATE_FALLBACK_CONFIDENCE = 0.60
+MIN_TOP_CANDIDATE_FALLBACK_SIMILARITY = 0.63
 DEFAULT_LLM_SHORTLIST_MAX = 5
 LLM_SHORTLIST_HARD_MAX = 5
-DOC_STATUS_PREFIX_RE = re.compile(
-    r"^(IFI\+?|IFC|IDC|IFR|IFA|IFD|ASB|IFF|IFT|IFO|AB|APP|INT)\s*[-–—]\s*",
-    re.I,
-)
-GENERIC_SUBJECT_TOKENS = frozenset(
-    {
-        "specification", "specifications", "sheet", "data", "ids", "rdds", "mto", "drawing",
-        "drawings", "layout", "report", "diagram", "system", "engineering", "document",
-        "documents", "revision", "approval", "period", "issue", "purchase", "including",
-        "material", "materials", "technical", "design", "plan", "details", "detail",
-        "general", "typical", "vendor", "package", "progress", "update", "delivery",
-        "and", "for", "the", "with", "from", "area", "period", "cancel", "deleted",
-    }
-)
 BUNDLE_DOC_TYPE_KEYWORDS = (
     "specification",
     "data sheet",
@@ -79,51 +74,15 @@ def clamp01(value):
     return max(0.0, min(1.0, safe_float(value)))
 
 
-def _task_subject_for_match(task_name: str) -> str:
-    s = str(task_name or "").strip()
-    s = DOC_STATUS_PREFIX_RE.sub("", s).strip()
-    s = remove_prefix(s).strip()
-    s = re.sub(r"\s*[-–—]\s*Revision and Approval Period\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s*[-–—]\s*\d+(?:st|nd|rd|th)?\s+Issue\s*$", "", s, flags=re.I)
-    s = re.sub(r"\s*[-–—]\s*Cancel\s*$", "", s, flags=re.I)
-    s = re.sub(r"/\d+\+?\s*$", "", s).strip()
-    return normalize(s)
-
-
-def _significant_tokens(text: str):
-    return [t for t in normalize(text).split() if t not in GENERIC_SUBJECT_TOKENS and len(t) > 2]
-
-
 def _subject_overlap(task_name: str, mdr_title: str, min_shared: int = 2) -> bool:
-    task_tokens = set(_significant_tokens(_task_subject_for_match(task_name)))
-    mdr_tokens = set(_significant_tokens(mdr_title))
+    task_tokens = set(significant_tokens(task_subject_for_match(task_name)))
+    mdr_tokens = set(significant_tokens(mdr_title))
     if not task_tokens or not mdr_tokens:
         return False
     shared = task_tokens & mdr_tokens
     if len(shared) >= min_shared:
         return True
     return len(shared) >= 1 and len(shared) / max(len(task_tokens), 1) >= 0.5
-
-
-def _mdr_title_match_score(task_name: str, mdr_title: str) -> float:
-    a = _task_subject_for_match(task_name)
-    b = normalize(mdr_title)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    if len(a) >= 12 and (a in b or b in a):
-        return 0.97
-    a_tokens = set(_significant_tokens(a))
-    b_tokens = set(_significant_tokens(b))
-    if not a_tokens or not b_tokens:
-        return 0.0
-    overlap = a_tokens & b_tokens
-    if len(overlap) >= 3:
-        return 0.92
-    if len(overlap) >= 2 and len(overlap) / max(len(a_tokens), 1) >= 0.5:
-        return 0.88
-    return 0.0
 
 
 def task_lists_document_bundle(task_name: str) -> bool:
@@ -136,16 +95,79 @@ def task_lists_document_bundle(task_name: str) -> bool:
 
 
 def _find_best_exact_match_candidate(task_group, task_name: str):
-    best_id = None
-    best_score = 0.0
-    for _, row in task_group.iterrows():
-        score = _mdr_title_match_score(task_name, row.get("MdrDocumentTitle", ""))
-        if score > best_score:
-            best_score = score
-            best_id = int(row["RetrievalRank"])
-    if best_id is None or best_score < 0.88:
-        return None, best_score
+    best_id, best_score = find_best_title_match(
+        task_group,
+        task_name,
+        id_col="RetrievalRank",
+    )
     return best_id, best_score
+
+
+def _link_blocked_by_subject_conflict(task_name: str, mdr_title: str) -> bool:
+    return link_subject_gates_block(task_name, mdr_title)
+
+
+def _link_mdr_title(row) -> str:
+    if row is None:
+        return ""
+    return str(row.get("MdrDocumentTitle", "") or "")
+
+
+def _fallback_llm_rank1_link(llm_links, task_group, task_name: str):
+    if not llm_links:
+        return []
+    rank_by_id = _rank_by_retrieval_id(task_group)
+    rank1 = dict(llm_links[0])
+    row = rank_by_id.get(int(rank1["candidate_id"]))
+    mdr = _link_mdr_title(row)
+    if mdr and _link_blocked_by_subject_conflict(task_name, mdr):
+        return []
+    fallback = dict(rank1)
+    fallback["link_method"] = LINK_METHOD_FALLBACK
+    if not str(fallback.get("reason_short", "")).strip():
+        fallback["reason_short"] = "Auto: LLM rank 1 fallback"
+    return [fallback]
+
+
+def _min_confidence_for_link(link, min_link_confidence: float) -> float:
+    method = str(link.get("link_method") or "")
+    if method == LINK_METHOD_TOP_CANDIDATE_FALLBACK:
+        return MIN_TOP_CANDIDATE_FALLBACK_CONFIDENCE
+    return min_link_confidence
+
+
+def _promote_top_candidate_fallback(resolved, task_group, task_name: str):
+    top_candidates = resolved.get("top_candidates") or []
+    if not top_candidates:
+        return None
+    rank_by_id = _rank_by_retrieval_id(task_group)
+    for item in top_candidates:
+        try:
+            candidate_id = int(item["candidate_id"])
+        except Exception:
+            continue
+        row = rank_by_id.get(candidate_id)
+        if row is None:
+            continue
+        mdr = _link_mdr_title(row)
+        if not mdr or _link_blocked_by_subject_conflict(task_name, mdr):
+            continue
+        similarity = safe_float(row.get("Similarity", 0.0))
+        confidence = safe_float(item.get("confidence", 0.0))
+        if similarity < MIN_TOP_CANDIDATE_FALLBACK_SIMILARITY:
+            continue
+        if confidence < MIN_TOP_CANDIDATE_FALLBACK_CONFIDENCE:
+            continue
+        reason = str(item.get("why_plausible", "") or "").strip()
+        if not reason:
+            reason = "Auto: promoted from LLM top_candidates shortlist"
+        return {
+            "candidate_id": candidate_id,
+            "confidence": confidence,
+            "reason_short": reason[:300],
+            "link_method": LINK_METHOD_TOP_CANDIDATE_FALLBACK,
+        }
+    return None
 
 
 def _filter_links_by_subject(links, task_group, task_name: str):
@@ -157,6 +179,8 @@ def _filter_links_by_subject(links, task_group, task_name: str):
         cid = int(link["candidate_id"])
         row = rank_by_id.get(cid)
         mdr = str(row.get("MdrDocumentTitle", "")) if row is not None else ""
+        if mdr and _link_blocked_by_subject_conflict(task_name, mdr):
+            continue
         if idx == 0 or _subject_overlap(task_name, mdr):
             kept.append(link)
     return kept
@@ -168,8 +192,9 @@ def refine_resolver_links(resolved, task_group):
     first = task_group.iloc[0]
     task_name = str(first.get("TaskName", ""))
     is_bundle = task_lists_document_bundle(task_name)
+    llm_links_original = list(resolved.get("links") or [])
     exact_id, exact_score = _find_best_exact_match_candidate(task_group, task_name)
-    links = list(resolved.get("links") or [])
+    links = list(llm_links_original)
     rank_by_id = _rank_by_retrieval_id(task_group)
 
     if exact_id is not None and not is_bundle:
@@ -207,17 +232,46 @@ def refine_resolver_links(resolved, task_group):
         links = _filter_links_by_subject(links, task_group, task_name)
     else:
         links = _filter_links_by_subject(links, task_group, task_name)
+        if not is_bundle and links:
+            rank1 = links[0]
+            row = rank_by_id.get(int(rank1["candidate_id"]))
+            mdr = _link_mdr_title(row)
+            if mdr and _link_blocked_by_subject_conflict(task_name, mdr):
+                alt_id, alt_score = _find_best_exact_match_candidate(task_group, task_name)
+                if alt_id is not None:
+                    alt_link = next((dict(x) for x in links if int(x["candidate_id"]) == alt_id), None)
+                    if alt_link is None:
+                        alt_link = {
+                            "candidate_id": alt_id,
+                            "confidence": max(0.88, alt_score),
+                            "reason_short": "Auto: subject token title match",
+                            "link_method": LINK_METHOD_EXACT,
+                        }
+                    links = [alt_link]
+                else:
+                    links = _fallback_llm_rank1_link(llm_links_original, task_group, task_name)
+
+    if not links and not is_bundle:
+        links = _fallback_llm_rank1_link(llm_links_original, task_group, task_name)
 
     deduped = []
     seen_keys = set()
     for link in links:
         cid = int(link["candidate_id"])
         row = rank_by_id.get(cid)
+        mdr = _link_mdr_title(row)
+        if mdr and _link_blocked_by_subject_conflict(task_name, mdr):
+            continue
         dkey = _raci_key_from_row(row) if row is not None else f"cid:{cid}"
         if dkey in seen_keys:
             continue
         seen_keys.add(dkey)
         deduped.append(link)
+
+    if not deduped and not is_bundle:
+        promoted = _promote_top_candidate_fallback(resolved, task_group, task_name)
+        if promoted is not None:
+            deduped = [promoted]
 
     out = dict(resolved)
     out["links"] = deduped
@@ -798,21 +852,35 @@ def build_final_rows_for_group(
         scope_ok = {"TimelineName": timeline_name, "TaskRowId": int(task_row_id)}
         selected = resolved.get("links", [])
         before_threshold = len(selected)
-        selected = [x for x in selected if safe_float(x.get("confidence", 0.0)) >= min_link_confidence]
+        selected = [
+            x
+            for x in selected
+            if safe_float(x.get("confidence", 0.0)) >= _min_confidence_for_link(x, min_link_confidence)
+        ]
         dropped_by_threshold = before_threshold - len(selected)
         similarity_by_id = {
             int(row["RetrievalRank"]): safe_float(row.get("Similarity", 0.0))
             for _, row in group.iterrows()
         }
-        selected = sorted(
-            selected,
-            key=lambda x: (
-                0 if str(x.get("link_method") or "") == LINK_METHOD_EXACT else 1,
-                -safe_float(x.get("confidence", 0.0)),
-                -similarity_by_id.get(int(x["candidate_id"]), 0.0),
-                int(x["candidate_id"]),
-            ),
-        )
+
+        def _link_sort_key(link):
+            method = str(link.get("link_method") or "")
+            if method == LINK_METHOD_EXACT:
+                tier = 0
+            elif method == LINK_METHOD_TOP_CANDIDATE_FALLBACK:
+                tier = 1
+            elif method == LINK_METHOD_FALLBACK:
+                tier = 2
+            else:
+                tier = 3
+            return (
+                tier,
+                -safe_float(link.get("confidence", 0.0)),
+                -similarity_by_id.get(int(link["candidate_id"]), 0.0),
+                int(link["candidate_id"]),
+            )
+
+        selected = sorted(selected, key=_link_sort_key)
         if max_links_per_task and max_links_per_task > 0:
             selected = selected[:max_links_per_task]
         saved_link_count = len(selected)
@@ -1041,15 +1109,14 @@ def _parse_json_text(text):
 def _build_batch_line(custom_id, task_group, cfg):
     model = cfg.get("LLM_MODEL", "gpt-4o-mini")
     system, user = build_resolver_prompts(task_group, cfg=cfg)
-    body = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
+    body = build_chat_completion_body(
+        model,
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
-        "response_format": {"type": "json_object"},
-    }
+        response_format={"type": "json_object"},
+    )
     return json.dumps(
         {
             "custom_id": custom_id,

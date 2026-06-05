@@ -8,6 +8,7 @@ from timeline_reconciliation_common import (
     CONFIG_FILE,
     blob_to_float32,
     connect_motherduck,
+    find_best_title_match,
     parse_config_txt,
     raci_dedupe_key,
 )
@@ -15,6 +16,7 @@ from timeline_reconciliation_common import (
 
 CREATED_BY = "3_timeline_task_to_mdr_topk.py"
 RETRIEVAL_METHOD = "embedding_cosine_topk"
+RETRIEVAL_METHOD_TITLE = "title_match_injection"
 
 
 def load_task_embeddings(conn, db_name, embedding_model, timeline_name=None):
@@ -152,8 +154,22 @@ def compute_topk(tasks, candidates, top_k):
                     continue
                 seen_keys.add(dkey)
                 unique_indices.append(int(cand_idx))
+            title_idx, title_score = find_best_title_match(
+                candidate_group,
+                str(task.get("TaskName", "")),
+            )
+            if title_idx is not None:
+                title_idx = int(title_idx)
+                unique_indices = [title_idx] + [i for i in unique_indices if i != title_idx]
+                unique_indices = unique_indices[:effective_k]
             for rank, cand_idx in enumerate(unique_indices, 1):
                 cand = candidate_group.iloc[int(cand_idx)]
+                cosine_similarity = float(similarities[int(cand_idx)])
+                is_title_injection = (
+                    rank == 1
+                    and title_idx is not None
+                    and int(cand_idx) == title_idx
+                )
                 rows.append(
                     {
                         "TimelineName": task["TimelineName"],
@@ -165,10 +181,10 @@ def compute_topk(tasks, candidates, top_k):
                         "MdrTitleKey": cand["MdrTitleKey"],
                         "ConsolidatedTitleKey": cand["ConsolidatedTitleKey"],
                         "ConsolidatedRaciTitle": cand["ConsolidatedRaciTitle"],
-                        "Similarity": float(similarities[int(cand_idx)]),
+                        "Similarity": max(cosine_similarity, title_score) if is_title_injection else cosine_similarity,
                         "Rank": rank,
                         "EmbeddingModel": task["EmbeddingModel"],
-                        "RetrievalMethod": RETRIEVAL_METHOD,
+                        "RetrievalMethod": RETRIEVAL_METHOD_TITLE if is_title_injection else RETRIEVAL_METHOD,
                         "TaskTextHash": task["TaskTextHash"],
                         "CandidateTextHash": cand["CandidateTextHash"],
                         "CreatedBy": CREATED_BY,
