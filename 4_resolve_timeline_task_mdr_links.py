@@ -29,6 +29,8 @@ from timeline_reconciliation_common import (
     task_subject_for_match,
     link_subject_gates_block,
     significant_tokens,
+    task_lists_document_bundle,
+    exact_title_match_strong_enough,
 )
 
 
@@ -41,20 +43,6 @@ MIN_TOP_CANDIDATE_FALLBACK_CONFIDENCE = 0.60
 MIN_TOP_CANDIDATE_FALLBACK_SIMILARITY = 0.63
 DEFAULT_LLM_SHORTLIST_MAX = 5
 LLM_SHORTLIST_HARD_MAX = 5
-BUNDLE_DOC_TYPE_KEYWORDS = (
-    "specification",
-    "data sheet",
-    "ids",
-    "rdds",
-    "mto",
-    "drawing",
-    "layout",
-    "report",
-    "diagram",
-    "schedule",
-    "follow up",
-    "follow-up",
-)
 BATCH_IDS_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_ids.json"
 BATCH_MANIFEST_FILE = Path(__file__).resolve().parent / ".timeline_resolver_last_batch_manifest.json"
 BATCH_ENDPOINT = "/v1/chat/completions"
@@ -83,15 +71,6 @@ def _subject_overlap(task_name: str, mdr_title: str, min_shared: int = 2) -> boo
     if len(shared) >= min_shared:
         return True
     return len(shared) >= 1 and len(shared) / max(len(task_tokens), 1) >= 0.5
-
-
-def task_lists_document_bundle(task_name: str) -> bool:
-    clean = remove_prefix(str(task_name or "")).lower()
-    if " / " not in clean:
-        return False
-    parts = [p.strip() for p in clean.split(" / ")]
-    hits = sum(1 for part in parts if any(kw in part for kw in BUNDLE_DOC_TYPE_KEYWORDS))
-    return hits >= 2
 
 
 def _find_best_exact_match_candidate(task_group, task_name: str):
@@ -186,6 +165,37 @@ def _filter_links_by_subject(links, task_group, task_name: str):
     return kept
 
 
+def _build_exact_link(exact_id, exact_score, existing=None):
+    if existing is not None:
+        exact_link = dict(existing)
+    else:
+        exact_link = {
+            "candidate_id": exact_id,
+            "confidence": max(0.97, exact_score),
+            "reason_short": "Auto: exact MDR title match",
+            "link_method": LINK_METHOD_EXACT,
+        }
+    exact_link["confidence"] = max(safe_float(exact_link.get("confidence")), 0.97, exact_score)
+    exact_link["link_method"] = LINK_METHOD_EXACT
+    if not str(exact_link.get("reason_short", "")).strip():
+        exact_link["reason_short"] = "Auto: exact MDR title match"
+    return exact_link
+
+
+def _should_apply_exact_override(task_name, exact_id, exact_score, task_group, llm_links_original):
+    if exact_id is None:
+        return False
+    row = _rank_by_retrieval_id(task_group).get(exact_id)
+    mdr = _link_mdr_title(row)
+    if not mdr or _link_blocked_by_subject_conflict(task_name, mdr):
+        return False
+    if any(int(x["candidate_id"]) == exact_id for x in llm_links_original):
+        return True
+    if not llm_links_original and exact_title_match_strong_enough(task_name, mdr, exact_score):
+        return True
+    return False
+
+
 def refine_resolver_links(resolved, task_group):
     if resolved.get("status") != "ok":
         return resolved
@@ -198,37 +208,22 @@ def refine_resolver_links(resolved, task_group):
     rank_by_id = _rank_by_retrieval_id(task_group)
 
     if exact_id is not None and not is_bundle:
-        exact_link = None
-        for link in links:
-            if int(link["candidate_id"]) == exact_id:
-                exact_link = dict(link)
-                break
-        if exact_link is None:
-            exact_link = {
-                "candidate_id": exact_id,
-                "confidence": max(0.97, exact_score),
-                "reason_short": "Auto: exact MDR title match",
-                "link_method": LINK_METHOD_EXACT,
-            }
+        if _should_apply_exact_override(task_name, exact_id, exact_score, task_group, llm_links_original):
+            exact_link = None
+            for link in links:
+                if int(link["candidate_id"]) == exact_id:
+                    exact_link = _build_exact_link(exact_id, exact_score, existing=link)
+                    break
+            if exact_link is None:
+                exact_link = _build_exact_link(exact_id, exact_score)
+            links = [exact_link]
         else:
-            exact_link = dict(exact_link)
-            exact_link["confidence"] = max(safe_float(exact_link.get("confidence")), 0.97, exact_score)
-            exact_link["link_method"] = LINK_METHOD_EXACT
-            if not str(exact_link.get("reason_short", "")).strip():
-                exact_link["reason_short"] = "Auto: exact MDR title match"
-        links = [exact_link]
+            links = _filter_links_by_subject(links, task_group, task_name)
     elif exact_id is not None and is_bundle:
-        has_exact = any(int(x["candidate_id"]) == exact_id for x in links)
-        if not has_exact:
-            links.insert(
-                0,
-                {
-                    "candidate_id": exact_id,
-                    "confidence": max(0.97, exact_score),
-                    "reason_short": "Auto: exact MDR title match",
-                    "link_method": LINK_METHOD_EXACT,
-                },
-            )
+        if _should_apply_exact_override(task_name, exact_id, exact_score, task_group, llm_links_original):
+            has_exact = any(int(x["candidate_id"]) == exact_id for x in links)
+            if not has_exact:
+                links.insert(0, _build_exact_link(exact_id, exact_score))
         links = _filter_links_by_subject(links, task_group, task_name)
     else:
         links = _filter_links_by_subject(links, task_group, task_name)
@@ -238,7 +233,14 @@ def refine_resolver_links(resolved, task_group):
             mdr = _link_mdr_title(row)
             if mdr and _link_blocked_by_subject_conflict(task_name, mdr):
                 alt_id, alt_score = _find_best_exact_match_candidate(task_group, task_name)
-                if alt_id is not None:
+                alt_row = rank_by_id.get(alt_id) if alt_id is not None else None
+                alt_mdr = _link_mdr_title(alt_row)
+                if (
+                    alt_id is not None
+                    and alt_mdr
+                    and not _link_blocked_by_subject_conflict(task_name, alt_mdr)
+                    and exact_title_match_strong_enough(task_name, alt_mdr, alt_score)
+                ):
                     alt_link = next((dict(x) for x in links if int(x["candidate_id"]) == alt_id), None)
                     if alt_link is None:
                         alt_link = {
@@ -683,16 +685,37 @@ at least one specific subject concept with task_name_clean (beyond generic words
 like document, drawing, specification, system, engineering), do NOT link
 regardless of embedding similarity or discipline match.
 
-Document type blocking rule:
+Document type parity — MANDATORY (blocking):
+Extract document_type from task_name_clean and from each candidate title.
+Link ONLY when subject AND document_type are both compatible.
+
+INCOMPATIBLE document-type pairs (do NOT link even if subject/equipment matches):
+- Technical Evaluation / TBE / TE  ↔  Specification / Data Sheet / IDS / Dossier
+- Drawing / Plan / Layout / Arrangement  ↔  MTO / BOQ / Material List / Take-off
+- Drawing  ↔  Calculation Report / Study Report / Sizing Report
+- Specification  ↔  IDS / MTO / Drawing (unless task is an explicit bundle)
+- Data Sheet  ↔  Purchase Specification / MTO (unless task lists both types)
+- Piping Arrangement  ↔  3D Model Activities (model is input, not the drawing deliverable)
+- SAT / FAT / Procedure  ↔  IDS / Data Sheet
+
+When task document type is specific, matching only on equipment or building name is NOT sufficient.
+If all candidates share the subject but differ in document type, return links: [] and explain the
+type mismatch in top_candidates. Do NOT pick the closest wrong document type.
+
+Facility identity — MANDATORY (blocking):
+When task_name_clean names a specific building, plant section, or area code
+(e.g. "Operation BLD", "Area I", "Area 3", "GT and ST", "Analyser Canopy"),
+the candidate MUST reference the SAME named facility.
+Do NOT link based only on shared words such as building, architectural, security, area, layout.
+"Operation Building" ≠ "Main Security Building".
+"P&ID for GT and ST" ≠ "P&ID CO2 extinguishing system".
+Different area numbers (e.g. Area 3 vs Area 10) are NOT interchangeable.
+
+Document type blocking rule (specific descriptors):
 When task_name_clean contains a highly specific drawing/document type descriptor
 (e.g. cross sectional, general arrangement, isometric, wiring diagram, hook-up,
-single line diagram, part list, bill of materials), that specific descriptor —
-or a direct synonym or translation — MUST be present in the MDR candidate title.
-Matching only on equipment name or system name is NOT sufficient.
-
-This rule does NOT apply to generic document types such as:
-report, diagram, data sheet, specification, sheet, plan, layout, list, schedule.
-For these, a strong subject/equipment name match is sufficient to allow the link.
+single line diagram, part list), that descriptor or a direct synonym MUST appear
+in the MDR candidate title. Matching only on equipment name is NOT sufficient.
 
 Multilingual equivalence: treat the following Italian–English pairs as equivalent
 when comparing task_name_clean to MDR candidate titles:
@@ -703,7 +726,11 @@ when comparing task_name_clean to MDR candidate titles:
 - relazione / report
 - foglio dati / data sheet
 - capitolato / specification
-- computo / bill of materials
+- computo / bill of materials / MTO / take-off
+- valutazione tecnica / technical evaluation / TBE / TE
+- relazione di calcolo / calculation report
+- procedura SAT / SAT procedure
+- disegno / drawing / dwgs
 
 When a task name explicitly lists multiple document types separated by "/" or "and"
 (e.g. "Specification / Data Sheet / IDS"), treat each type independently.
@@ -713,7 +740,7 @@ specific subject/equipment as the task (e.g. MV Cables, not switchgear).
 
 Rank 1 priority rule:
 If one candidate's mdr_document_title is an exact or near-exact match to task_name_clean
-(same subject and document scope), that candidate MUST be link rank 1 with highest confidence.
+(same subject, same document type, same facility scope), that candidate MUST be link rank 1.
 Prefer the specific MDR document title over a generic RACI category title.
 
 Secondary links (rank 2+):

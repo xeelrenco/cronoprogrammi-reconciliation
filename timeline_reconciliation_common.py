@@ -42,6 +42,23 @@ def normalize(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def document_title_join_key(text) -> str:
+    """Stable key for joining historical MDR titles to consolidated titles."""
+    return normalize(text)
+
+
+def sql_document_title_join_key(column_sql: str) -> str:
+    """SQL expression matching document_title_join_key() for DuckDB joins."""
+    col = column_sql
+    return (
+        f"lower(trim(regexp_replace("
+        f"regexp_replace("
+        f"regexp_replace(replace(lower({col}), '&', ' and '), '\\([^)]*\\)', ' ', 'g'), "
+        f"'[^a-z0-9]+', ' ', 'g'), "
+        f"'\\s+', ' ', 'g')))"
+    )
+
+
 def raci_dedupe_key(
     consolidated_title_key=None,
     mdr_title_key=None,
@@ -103,13 +120,16 @@ DRAINAGE_SUBTYPE_TOKENS = {
     "groundwater": frozenset({"groundwater"}),
     "rain": frozenset({"rain", "storm", "rainwater", "stormwater"}),
     "sewer": frozenset({"sewer", "sewerage", "sanitary"}),
+    "sump": frozenset({"sump", "closed"}),
 }
 INCOMPATIBLE_DRAINAGE_SUBTYPES = frozenset(
     {
         ("groundwater", "rain"),
         ("groundwater", "sewer"),
+        ("groundwater", "sump"),
         ("rain", "groundwater"),
         ("sewer", "groundwater"),
+        ("sump", "groundwater"),
     }
 )
 EQUIPMENT_ANCHOR_RULES = (
@@ -117,6 +137,97 @@ EQUIPMENT_ANCHOR_RULES = (
     frozenset({"soft", "start"}),
 )
 EQUIPMENT_ANCHOR_MATCH_SCORE = 0.93
+BUNDLE_DOC_TYPE_KEYWORDS = (
+    "specification",
+    "data sheet",
+    "ids",
+    "rdds",
+    "mto",
+    "drawing",
+    "layout",
+    "report",
+    "diagram",
+    "schedule",
+    "follow up",
+    "follow-up",
+)
+INCOMPATIBLE_DOCUMENT_TYPE_PAIRS = frozenset(
+    {
+        ("tbe", "specification"),
+        ("tbe", "data_sheet"),
+        ("tbe", "ids"),
+        ("tbe", "dossier"),
+        ("drawing", "mto"),
+        ("drawing", "calculation"),
+        ("drawing", "model_3d"),
+        ("specification", "ids"),
+        ("specification", "mto"),
+        ("specification", "drawing"),
+        ("data_sheet", "specification"),
+        ("data_sheet", "mto"),
+        ("data_sheet", "ids"),
+        ("drawing", "data_sheet"),
+        ("tbe", "drawing"),
+        ("procedure", "ids"),
+        ("procedure", "data_sheet"),
+        ("ids", "dossier"),
+        ("data_sheet", "dossier"),
+        ("arrangement", "model_3d"),
+        ("pid", "mto"),
+    }
+)
+FACILITY_IDENTITY_MARKERS = {
+    "operation": frozenset({"operation"}),
+    "security": frozenset({"security"}),
+    "analyser": frozenset({"analyser", "analyzer"}),
+    "co2": frozenset({"co2", "extinguishing", "extinguisher"}),
+    "gt_st": frozenset({"gt", "st", "turbine", "steam"}),
+}
+INCOMPATIBLE_FACILITY_MARKERS = frozenset(
+    {
+        ("operation", "security"),
+        ("gt_st", "co2"),
+    }
+)
+EQUIPMENT_MODIFIER_CONFLICTS = (
+    (frozenset({"manual"}), frozenset({"actuated"})),
+    (frozenset({"scu", "ucp"}), frozenset({"fgs"})),
+    (frozenset({"firefighting"}), frozenset({"inert"})),
+)
+REQUIRED_DESCRIPTOR_TOKENS = frozenset(
+    {
+        "architectural",
+        "structural",
+        "manual",
+        "actuated",
+        "arrangement",
+    }
+)
+SCOPE_NARROWING_MARKERS = frozenset({"portable", "inert"})
+SCOPE_DOMAIN_TOKENS = frozenset(
+    {
+        "firefighting",
+        "fire",
+        "fighting",
+        "extinguishing",
+        "lifting",
+        "hoists",
+        "hoist",
+        "cranes",
+        "crane",
+        "davits",
+        "davit",
+    }
+)
+
+
+def task_lists_document_bundle(task_name: str) -> bool:
+    clean = remove_prefix(str(task_name or "")).lower()
+    if " / " not in clean:
+        return False
+    parts = [p.strip() for p in clean.split(" / ")]
+    hits = sum(1 for part in parts if any(kw in part for kw in BUNDLE_DOC_TYPE_KEYWORDS))
+    return hits >= 2
 
 
 def task_subject_for_match(task_name: str) -> str:
@@ -130,12 +241,183 @@ def task_subject_for_match(task_name: str) -> str:
     return normalize(s)
 
 
+def _match_text_for_document_types(text: str) -> str:
+    return task_subject_for_match(text) if text else normalize(text)
+
+
+def extract_document_types(text: str) -> set:
+    n = _match_text_for_document_types(text)
+    if not n:
+        return set()
+    types = set()
+    if re.search(r"\b(tbe|technical evaluation|tech(?:nical)?\s+eval(?:uation)?|te for)\b", n):
+        types.add("tbe")
+    if re.search(r"\b(inspection data sheets?|inspections data sheets?)\b", n) or re.search(
+        r"\bids\b", n
+    ):
+        types.add("ids")
+    elif re.search(r"\b(data sheets?|datasheet|foglio dati|technical data sheet)\b", n):
+        types.add("data_sheet")
+    if re.search(
+        r"\b(specifications?|supply specs?|capitolato|design specification|specification for purchase|technical supply specification)\b",
+        n,
+    ):
+        types.add("specification")
+    if re.search(r"\b(3d model|3 d model)\b", n):
+        types.add("model_3d")
+    elif re.search(
+        r"\b(calculation report|sizing report|study report|relazione di calcolo|structural calcul\w*)\b",
+        n,
+    ):
+        types.add("calculation")
+    elif re.search(
+        r"\b(drawing|drawings|dwg|dwgs|planimetria|layout|arrangement|isometric|architectural design|structural drawings|grading plan|plot plan|general arrangement|piping assembly)\b",
+        n,
+    ):
+        types.add("drawing")
+    elif re.search(r"\bpiping arrangement\b", n):
+        types.add("arrangement")
+    elif re.search(r"\b(plan|sections|elevations)\b", n) and not types & {"specification", "tbe"}:
+        types.add("drawing")
+    if re.search(r"\b(mto|boq|bill of quantities|take off|takeoff|material list|materials mto)\b", n):
+        types.add("mto")
+    if re.search(r"\b(sat procedure|fat procedure|check sheets|check sheet)\b", n) or (
+        re.search(r"\bprocedure\b", n) and "specification" not in n
+    ):
+        types.add("procedure")
+    if re.search(
+        r"\b(p id|p&id|pid|piping instrumentation diagrams?|piping and instrument diagrams?|instrumentation diagrams?)\b",
+        n,
+    ):
+        types.add("pid")
+    if re.search(r"\b(dossier|pre commissioning|precommissioning)\b", n):
+        types.add("dossier")
+    if re.search(r"\b(platform|access platform)\b", n) or re.search(r"\bplt[- ]?\d", n):
+        types.add("drawing")
+    if re.search(r"\b(formwork|reinforcement)\b", n):
+        types.add("calculation")
+    return types
+
+
+def _document_types_compatible(task_type: str, mdr_type: str) -> bool:
+    if task_type == mdr_type:
+        return True
+    if {task_type, mdr_type} <= {"drawing", "arrangement"}:
+        return True
+    return (task_type, mdr_type) not in INCOMPATIBLE_DOCUMENT_TYPE_PAIRS and (
+        mdr_type,
+        task_type,
+    ) not in INCOMPATIBLE_DOCUMENT_TYPE_PAIRS
+
+
+def document_type_conflict(task_name: str, mdr_title: str) -> bool:
+    is_bundle = task_lists_document_bundle(task_name)
+    task_types = extract_document_types(task_name)
+    mdr_types = extract_document_types(mdr_title)
+    if not task_types or not mdr_types:
+        return False
+    if is_bundle:
+        return not any(
+            _document_types_compatible(task_type, mdr_type)
+            for task_type in task_types
+            for mdr_type in mdr_types
+        )
+    for task_type in task_types:
+        for mdr_type in mdr_types:
+            if not _document_types_compatible(task_type, mdr_type):
+                return True
+    return False
+
+
+def _area_codes(text: str) -> set:
+    return {m.group(1) for m in re.finditer(r"\barea\s+([a-z0-9]+)\b", normalize(text))}
+
+
+def _facility_marker_keys(tokens) -> set:
+    keys = set()
+    for key, markers in FACILITY_IDENTITY_MARKERS.items():
+        if tokens & markers:
+            keys.add(key)
+    return keys
+
+
+def facility_identity_conflict(task_name: str, mdr_title: str) -> bool:
+    task_text = task_subject_for_match(task_name)
+    mdr_text = normalize(mdr_title)
+    task_tokens = set(task_text.split()) | _parenthetical_tokens(task_name)
+    mdr_tokens = set(mdr_text.split()) | _parenthetical_tokens(mdr_title)
+    task_areas = _area_codes(task_text)
+    mdr_areas = _area_codes(mdr_text)
+    if task_areas and mdr_areas and not (task_areas & mdr_areas):
+        return True
+    if {"gt", "st"} <= task_tokens and not ({"gt", "st"} & mdr_tokens):
+        if "pid" in extract_document_types(task_name) or "diagram" in task_text:
+            return True
+    task_facility = _facility_marker_keys(task_tokens)
+    mdr_facility = _facility_marker_keys(mdr_tokens)
+    if not task_facility or not mdr_facility:
+        return False
+    if task_facility & mdr_facility:
+        return False
+    for task_key in task_facility:
+        for mdr_key in mdr_facility:
+            if (task_key, mdr_key) in INCOMPATIBLE_FACILITY_MARKERS or (
+                mdr_key,
+                task_key,
+            ) in INCOMPATIBLE_FACILITY_MARKERS:
+                return True
+    return False
+
+
+def equipment_modifier_conflict(task_name: str, mdr_title: str) -> bool:
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    for task_mods, mdr_mods in EQUIPMENT_MODIFIER_CONFLICTS:
+        if (task_tokens & task_mods) and (mdr_tokens & mdr_mods) and not (task_tokens & mdr_mods):
+            return True
+        if (mdr_tokens & task_mods) and (task_tokens & mdr_mods) and not (mdr_tokens & task_mods):
+            return True
+    return False
+
+
+def _document_types_share_family(task_types, mdr_types) -> bool:
+    if not task_types or not mdr_types:
+        return False
+    return any(
+        _document_types_compatible(task_type, mdr_type)
+        for task_type in task_types
+        for mdr_type in mdr_types
+    )
+
+
+def descriptor_mismatch_conflict(task_name: str, mdr_title: str) -> bool:
+    task_types = extract_document_types(task_name)
+    mdr_types = extract_document_types(mdr_title)
+    if not _document_types_share_family(task_types, mdr_types):
+        return False
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    for desc in REQUIRED_DESCRIPTOR_TOKENS:
+        if desc in task_tokens and desc not in mdr_tokens:
+            return True
+    return False
+
+
 def significant_tokens(text: str):
     return [t for t in normalize(text).split() if t not in GENERIC_SUBJECT_TOKENS and len(t) > 2]
 
 
+def _parenthetical_tokens(text: str) -> set:
+    tokens = set()
+    for m in re.finditer(r"\(([A-Za-z0-9/&+\-\s]{2,40})\)", str(text or "")):
+        inner = normalize(m.group(1))
+        tokens.update(t for t in inner.split() if len(t) > 1)
+    return tokens
+
+
 def normalized_match_tokens(text: str):
     expanded = set(significant_tokens(text))
+    expanded |= _parenthetical_tokens(text)
     for token in list(expanded):
         alias = SUBJECT_TOKEN_ALIASES.get(token)
         if alias:
@@ -172,8 +454,30 @@ def shares_equipment_anchor(task_name: str, mdr_title: str) -> bool:
     return any(rule <= task_tokens and rule <= mdr_tokens for rule in EQUIPMENT_ANCHOR_RULES)
 
 
+def equipment_scope_narrowing_conflict(task_name: str, mdr_title: str) -> bool:
+    """Block when MDR is a narrower equipment scope (e.g. portable) than the task."""
+    task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
+    mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
+    mdr_narrow = SCOPE_NARROWING_MARKERS & mdr_tokens
+    if not mdr_narrow or (SCOPE_NARROWING_MARKERS & task_tokens):
+        return False
+    if not (task_tokens & SCOPE_DOMAIN_TOKENS) or not (mdr_tokens & SCOPE_DOMAIN_TOKENS):
+        return False
+    return True
+
+
 def link_subject_gates_block(task_name: str, mdr_title: str) -> bool:
     if drainage_subtype_conflict(task_name, mdr_title):
+        return True
+    if document_type_conflict(task_name, mdr_title):
+        return True
+    if facility_identity_conflict(task_name, mdr_title):
+        return True
+    if equipment_modifier_conflict(task_name, mdr_title):
+        return True
+    if equipment_scope_narrowing_conflict(task_name, mdr_title):
+        return True
+    if descriptor_mismatch_conflict(task_name, mdr_title):
         return True
     return title_has_hard_subject_conflict(task_name, mdr_title)
 
@@ -194,14 +498,6 @@ def candidate_title_match_score(task_name: str, row, mdr_title_col="MdrDocumentT
     return max(scores) if scores else 0.0
 
 
-def _is_building_alias_case(task_tokens, mdr_tokens) -> bool:
-    if not (task_tokens & BUILDING_CONTEXT_TOKENS):
-        return False
-    if not (mdr_tokens & BUILDING_CONTEXT_TOKENS):
-        return False
-    return True
-
-
 def title_has_hard_subject_conflict(task_name: str, mdr_title: str, score=None) -> bool:
     """True only for near-duplicate titles with swapped equipment/subject (e.g. Compressor vs Gearbox)."""
     if shares_equipment_anchor(task_name, mdr_title):
@@ -214,8 +510,6 @@ def title_has_hard_subject_conflict(task_name: str, mdr_title: str, score=None) 
         return False
     task_tokens = normalized_match_tokens(task_subject_for_match(task_name))
     mdr_tokens = normalized_match_tokens(str(mdr_title or ""))
-    if _is_building_alias_case(task_tokens, mdr_tokens):
-        return False
     unmatched_task = task_tokens - mdr_tokens
     unmatched_mdr = mdr_tokens - task_tokens
     if not unmatched_task or not unmatched_mdr:
@@ -250,11 +544,32 @@ def mdr_title_match_score(task_name: str, mdr_title: str) -> float:
 def title_match_qualifies(task_name: str, mdr_title: str, score: float) -> bool:
     if drainage_subtype_conflict(task_name, mdr_title):
         return False
-    if score >= TITLE_MATCH_STRONG_SCORE:
-        return True
+    if document_type_conflict(task_name, mdr_title):
+        return False
+    if facility_identity_conflict(task_name, mdr_title):
+        return False
+    if equipment_modifier_conflict(task_name, mdr_title):
+        return False
+    if equipment_scope_narrowing_conflict(task_name, mdr_title):
+        return False
+    if descriptor_mismatch_conflict(task_name, mdr_title):
+        return False
     if score < TITLE_MATCH_MIN_SCORE:
         return False
+    if score >= TITLE_MATCH_STRONG_SCORE:
+        return True
     return not title_has_hard_subject_conflict(task_name, mdr_title, score)
+
+
+def exact_title_match_strong_enough(task_name: str, mdr_title: str, score: float) -> bool:
+    """True for near-duplicate titles or equipment-anchor matches, not token-overlap-only."""
+    if not title_match_qualifies(task_name, mdr_title, score):
+        return False
+    if score >= TITLE_MATCH_STRONG_SCORE:
+        return True
+    if score >= EQUIPMENT_ANCHOR_MATCH_SCORE and shares_equipment_anchor(task_name, mdr_title):
+        return True
+    return False
 
 
 def _title_match_rank_key(task_name: str, mdr_title: str, score: float):

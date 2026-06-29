@@ -11,6 +11,9 @@ from timeline_reconciliation_common import (
     find_best_title_match,
     parse_config_txt,
     raci_dedupe_key,
+    TITLE_MATCH_STRONG_SCORE,
+    EQUIPMENT_ANCHOR_MATCH_SCORE,
+    shares_equipment_anchor,
 )
 
 
@@ -158,6 +161,14 @@ def compute_topk(tasks, candidates, top_k):
                 candidate_group,
                 str(task.get("TaskName", "")),
             )
+            if title_idx is not None and title_score < TITLE_MATCH_STRONG_SCORE:
+                cand = candidate_group.iloc[int(title_idx)]
+                mdr = str(cand.get("MdrDocumentTitle", ""))
+                if not (
+                    title_score >= EQUIPMENT_ANCHOR_MATCH_SCORE
+                    and shares_equipment_anchor(str(task.get("TaskName", "")), mdr)
+                ):
+                    title_idx = None
             if title_idx is not None:
                 title_idx = int(title_idx)
                 unique_indices = [title_idx] + [i for i in unique_indices if i != title_idx]

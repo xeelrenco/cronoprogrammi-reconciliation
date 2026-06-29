@@ -11,6 +11,7 @@ from timeline_reconciliation_common import (
     extract_project_code,
     float32_to_blob,
     parse_config_txt,
+    sql_document_title_join_key,
     text_hash,
 )
 
@@ -58,6 +59,9 @@ def load_mdr_candidates(conn, db_name, timeline_name=None):
     if timeline_name:
         timeline_filter = "AND Mdr_code_name_ref = ?"
         params.append(timeline_name)
+    title_key = sql_document_title_join_key
+    join_hist_key = title_key("m.Document_title")
+    join_cons_key = title_key("c.Document_title")
     return conn.execute(
         f"""
         WITH mdr_docs AS (
@@ -86,7 +90,7 @@ def load_mdr_candidates(conn, db_name, timeline_name=None):
             e.ChapterName
         FROM {db_name}.mdr_reconciliation.v_MdrReconciliationResults_Consolidated c
         JOIN mdr_docs m
-          ON m.Document_title = c.Document_title
+          ON {join_hist_key} = {join_cons_key}
         LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentTitleDescriptions_Final d
           ON d.TitleKey = c.ConsolidatedTitleKey
         LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentsEnriched e
