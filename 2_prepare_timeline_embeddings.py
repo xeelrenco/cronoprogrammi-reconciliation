@@ -93,7 +93,7 @@ def load_mdr_candidates(conn, db_name, timeline_name=None):
           ON {join_hist_key} = {join_cons_key}
         LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentTitleDescriptions_Final d
           ON d.TitleKey = c.ConsolidatedTitleKey
-        LEFT JOIN {db_name}.mdr_reconciliation.v_DocumentsEnriched e
+        LEFT JOIN {db_name}.raci_matrix.v_DocumentsEnriched e
           ON e.TitleKey = c.ConsolidatedTitleKey
         WHERE c.ConsolidatedDecisionType = 'MATCH'
         ORDER BY TimelineName, MdrDocumentTitle
